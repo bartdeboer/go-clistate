@@ -147,6 +147,18 @@ func (s *Store) GetBool(key string, def bool, override ...*bool) bool {
 	return def
 }
 
+func (s *Store) GetStruct(key string, out any) bool {
+	v, ok := s.get(key)
+	if !ok {
+		return false
+	}
+	b, err := json.Marshal(v)
+	if err != nil {
+		return false
+	}
+	return json.Unmarshal(b, out) == nil
+}
+
 // -------------- public persistence --------------
 
 func (s *Store) PersistString(key, val string) error {
@@ -159,6 +171,9 @@ func (s *Store) PersistFloat(key string, val float64) error {
 	return s.persist(key, val)
 }
 func (s *Store) PersistBool(key string, val bool) error {
+	return s.persist(key, val)
+}
+func (s *Store) PersistStruct(key string, val any) error {
 	return s.persist(key, val)
 }
 
@@ -268,4 +283,41 @@ func setInMap(root map[string]any, key string, val any) {
 		}
 		m = asMap
 	}
+}
+
+// GetTyped returns the zero value of T if the key is missing or cannot be decoded into T.
+func GetTyped[T any](s *Store, key string) T {
+	v, ok := GetTypedOK[T](s, key)
+	if !ok {
+		var zero T
+		return zero
+	}
+	return v
+}
+
+// GetTypedOK returns (value, true) when found and decoded successfully.
+// If missing or decode fails, returns (zero, false).
+func GetTypedOK[T any](s *Store, key string) (T, bool) {
+	var zero T
+	v, ok := s.get(key)
+	if !ok {
+		return zero, false
+	}
+
+	b, err := json.Marshal(v)
+	if err != nil {
+		return zero, false
+	}
+
+	var out T
+	if err := json.Unmarshal(b, &out); err != nil {
+		return zero, false
+	}
+	return out, true
+}
+
+// PersistTyped persists val under key.
+// This stores the concrete type in-memory, and JSON encoding will serialize it correctly.
+func PersistTyped[T any](s *Store, key string, val T) error {
+	return s.persist(key, val)
 }
