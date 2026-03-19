@@ -1,9 +1,11 @@
 package clistate
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -12,6 +14,7 @@ import (
 )
 
 type Store struct {
+	app    string
 	path   string
 	data   map[string]any
 	loaded bool
@@ -34,6 +37,7 @@ func NewGlobal(app, name string) (*Store, error) {
 		return nil, err
 	}
 	return &Store{
+		app:  app,
 		path: filepath.Join(dir, name+".json"),
 		data: make(map[string]any),
 	}, nil
@@ -49,6 +53,7 @@ func NewCwd(app, name string) (*Store, error) {
 	}
 
 	s := &Store{
+		app:  app,
 		path: filepath.Join(dir, name+".json"),
 		data: make(map[string]any),
 	}
@@ -157,6 +162,35 @@ func (s *Store) GetStruct(key string, out any) bool {
 		return false
 	}
 	return json.Unmarshal(b, out) == nil
+}
+
+func (s *Store) GetProjectDir() string {
+	if s == nil || strings.TrimSpace(s.app) == "" {
+		return ""
+	}
+
+	cwd, err := os.Getwd()
+	if err == nil {
+		cmd := exec.CommandContext(context.Background(), "go", "list", "-m", "-json")
+		cmd.Dir = cwd
+
+		out, err := cmd.Output()
+		if err == nil {
+			var mod struct {
+				Path string
+				Dir  string
+			}
+
+			if json.Unmarshal(out, &mod) == nil {
+				if filepath.Base(mod.Path) == s.app && strings.TrimSpace(mod.Dir) != "" {
+					_ = s.PersistString("project_dir", mod.Dir)
+					return mod.Dir
+				}
+			}
+		}
+	}
+
+	return s.GetString("project_dir", "")
 }
 
 // -------------- public persistence --------------
