@@ -182,7 +182,7 @@ func (s *Store) GetProjectDir() string {
 			}
 
 			if json.Unmarshal(out, &mod) == nil {
-				if filepath.Base(mod.Path) == s.app && strings.TrimSpace(mod.Dir) != "" {
+				if modulePathMatchesApp(mod.Path, s.app) && strings.TrimSpace(mod.Dir) != "" {
 					_ = s.PersistString("project_dir", mod.Dir)
 					return mod.Dir
 				}
@@ -191,6 +191,15 @@ func (s *Store) GetProjectDir() string {
 	}
 
 	return s.GetString("project_dir", "")
+}
+
+func modulePathMatchesApp(modulePath string, app string) bool {
+	base := filepath.Base(modulePath)
+	if base == app {
+		return true
+	}
+
+	return strings.TrimPrefix(base, "go-") == app
 }
 
 // -------------- public persistence --------------
