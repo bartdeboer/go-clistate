@@ -3,6 +3,7 @@ package clistate
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"flag"
 	"os"
 	"os/exec"
@@ -165,41 +166,74 @@ func (s *Store) GetStruct(key string, out any) bool {
 }
 
 func (s *Store) GetProjectDir() string {
-	if s == nil || strings.TrimSpace(s.app) == "" {
+	if s == nil {
 		return ""
 	}
 
-	cwd, err := os.Getwd()
-	if err == nil {
+	app := strings.TrimSpace(s.app)
+	if app == "" {
+		return ""
+	}
+
+	projectDir, err := func() (string, error) {
+		cwd, err := os.Getwd()
+		if err != nil {
+			return "", err
+		}
+
+		cwd, err = filepath.Abs(cwd)
+		if err != nil {
+			return "", err
+		}
+
 		cmd := exec.CommandContext(context.Background(), "go", "list", "-m", "-json")
 		cmd.Dir = cwd
 
 		out, err := cmd.Output()
-		if err == nil {
-			var mod struct {
-				Path string
-				Dir  string
-			}
-
-			if json.Unmarshal(out, &mod) == nil {
-				if modulePathMatchesApp(mod.Path, s.app) && strings.TrimSpace(mod.Dir) != "" {
-					_ = s.PersistString("project_dir", mod.Dir)
-					return mod.Dir
-				}
-			}
+		if err != nil {
+			return "", err
 		}
+
+		var mod struct {
+			Path string
+			Dir  string
+		}
+		if err := json.Unmarshal(out, &mod); err != nil {
+			return "", err
+		}
+
+		moduleName := filepath.Base(strings.TrimSpace(mod.Path))
+		if moduleName != app && strings.TrimPrefix(moduleName, "go-") != app {
+			return "", fmt.Errorf("module %q does not match app %q", moduleName, app)
+		}
+
+		projectDir := strings.TrimSpace(mod.Dir)
+		if projectDir == "" {
+			return "", fmt.Errorf("module directory is empty")
+		}
+
+		projectDir, err = filepath.Abs(projectDir)
+		if err != nil {
+			return "", err
+		}
+
+		rel, err := filepath.Rel(projectDir, cwd)
+		if err != nil {
+			return "", err
+		}
+		if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return "", fmt.Errorf("cwd %q is outside project %q", cwd, projectDir)
+		}
+
+		return projectDir, nil
+	}()
+
+	if err == nil && projectDir != "" {
+		_ = s.PersistString("project_dir", projectDir)
+		return projectDir
 	}
 
-	return s.GetString("project_dir", "")
-}
-
-func modulePathMatchesApp(modulePath string, app string) bool {
-	base := filepath.Base(modulePath)
-	if base == app {
-		return true
-	}
-
-	return strings.TrimPrefix(base, "go-") == app
+	return strings.TrimSpace(s.GetString("project_dir", ""))
 }
 
 // -------------- public persistence --------------
