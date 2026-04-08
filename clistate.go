@@ -3,8 +3,8 @@ package clistate
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"flag"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -24,6 +24,18 @@ type Store struct {
 	flags  *flag.FlagSet
 
 	mu sync.Mutex
+}
+
+type segmentKind int
+
+const (
+	segmentField segmentKind = iota
+	segmentLiteral
+)
+
+type pathSegment struct {
+	kind  segmentKind
+	value string
 }
 
 // NewGlobal creates a global store at ~/.<app>/<name>.json
@@ -304,28 +316,157 @@ func (s *Store) persist(key string, val any) error {
 	defer s.mu.Unlock()
 
 	s.load()
-	setInMap(s.data, key, val)
+	if err := setInMap(s.data, key, val); err != nil {
+		return err
+	}
 	return s.save()
 }
 
-// getFromMap traverses nested maps using dot-separated keys,
-// converting each segment to snake_case for JSON storage.
+func normalizeFieldName(v string) string {
+	return words.ToSnakeCase(v)
+}
+
+func resolveSegmentKey(seg pathSegment) string {
+	if seg.kind == segmentLiteral {
+		return seg.value
+	}
+	return normalizeFieldName(seg.value)
+}
+
+// parsePath parses paths like:
+//
+//	profile.name
+//	chats["abc123"].providerChatID
+//	chats['abc123'].provider_chat_id
+//
+// Rules:
+//   - dot segments are field names and will be snake-cased for storage
+//   - bracket segments are literal keys and are never normalized
+//   - bracket keys must be quoted with ' or "
+func parsePath(path string) ([]pathSegment, error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return nil, fmt.Errorf("empty path")
+	}
+
+	var segs []pathSegment
+	i := 0
+
+	readField := func(start int) (string, int, error) {
+		j := start
+		for j < len(path) && path[j] != '.' && path[j] != '[' {
+			if path[j] == ']' {
+				return "", j, fmt.Errorf("unexpected ] at position %d", j)
+			}
+			j++
+		}
+		field := strings.TrimSpace(path[start:j])
+		if field == "" {
+			return "", j, fmt.Errorf("empty field segment at position %d", start)
+		}
+		return field, j, nil
+	}
+
+	readBracket := func(start int) (string, int, error) {
+		if start+1 >= len(path) {
+			return "", start, fmt.Errorf("unterminated bracket at position %d", start)
+		}
+
+		quote := path[start+1]
+		if quote != '"' && quote != '\'' {
+			return "", start, fmt.Errorf("bracket key must start with quoted string at position %d", start)
+		}
+
+		var b strings.Builder
+		j := start + 2
+
+		for j < len(path) {
+			ch := path[j]
+			if ch == '\\' {
+				if j+1 >= len(path) {
+					return "", j, fmt.Errorf("dangling escape in bracket key at position %d", j)
+				}
+				b.WriteByte(path[j+1])
+				j += 2
+				continue
+			}
+			if ch == quote {
+				j++
+				if j >= len(path) || path[j] != ']' {
+					return "", j, fmt.Errorf("expected ] after quoted bracket key at position %d", j)
+				}
+				return b.String(), j + 1, nil
+			}
+			b.WriteByte(ch)
+			j++
+		}
+
+		return "", j, fmt.Errorf("unterminated quoted bracket key starting at position %d", start)
+	}
+
+	for i < len(path) {
+		switch path[i] {
+		case '.':
+			return nil, fmt.Errorf("unexpected dot at position %d", i)
+		case '[':
+			lit, next, err := readBracket(i)
+			if err != nil {
+				return nil, err
+			}
+			segs = append(segs, pathSegment{kind: segmentLiteral, value: lit})
+			i = next
+		default:
+			field, next, err := readField(i)
+			if err != nil {
+				return nil, err
+			}
+			segs = append(segs, pathSegment{kind: segmentField, value: field})
+			i = next
+		}
+
+		if i < len(path) {
+			switch path[i] {
+			case '.':
+				i++
+				if i >= len(path) {
+					return nil, fmt.Errorf("path cannot end with dot")
+				}
+			case '[':
+				// immediate bracket continuation is allowed, e.g. chats["abc"]
+			default:
+				return nil, fmt.Errorf("unexpected character %q at position %d", path[i], i)
+			}
+		}
+	}
+
+	if len(segs) == 0 {
+		return nil, fmt.Errorf("empty path")
+	}
+
+	return segs, nil
+}
+
+// getFromMap traverses nested maps using parsed path segments.
+// Field segments are snake-cased. Literal bracket segments are not.
 func getFromMap(root map[string]any, key string) (any, bool) {
-	parts := strings.Split(key, ".")
+	segs, err := parsePath(key)
+	if err != nil {
+		return nil, false
+	}
 	m := any(root)
 
-	for i, p := range parts {
-		snake := words.ToSnakeCase(p)
+	for i, seg := range segs {
+		stored := resolveSegmentKey(seg)
 
 		asMap, ok := m.(map[string]any)
 		if !ok {
 			return nil, false
 		}
-		v, ok := asMap[snake]
+		v, ok := asMap[stored]
 		if !ok {
 			return nil, false
 		}
-		if i == len(parts)-1 {
+		if i == len(segs)-1 {
 			return v, true
 		}
 		m = v
@@ -334,32 +475,37 @@ func getFromMap(root map[string]any, key string) (any, bool) {
 }
 
 // setInMap mirrors getFromMap but creates intermediate maps as needed.
-func setInMap(root map[string]any, key string, val any) {
-	parts := strings.Split(key, ".")
+func setInMap(root map[string]any, key string, val any) error {
+	segs, err := parsePath(key)
+	if err != nil {
+		return err
+	}
 	m := root
 
-	for i, p := range parts {
-		snake := words.ToSnakeCase(p)
-		if i == len(parts)-1 {
-			m[snake] = val
-			return
+	for i, seg := range segs {
+		stored := resolveSegmentKey(seg)
+		if i == len(segs)-1 {
+			m[stored] = val
+			return nil
 		}
-		next, ok := m[snake]
+		next, ok := m[stored]
 		if !ok {
 			child := map[string]any{}
-			m[snake] = child
+			m[stored] = child
 			m = child
 			continue
 		}
 		asMap, ok := next.(map[string]any)
 		if !ok {
 			child := map[string]any{}
-			m[snake] = child
+			m[stored] = child
 			m = child
 			continue
 		}
 		m = asMap
 	}
+
+	return nil
 }
 
 // GetTyped returns the zero value of T if the key is missing or cannot be decoded into T.

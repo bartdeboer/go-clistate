@@ -72,6 +72,99 @@ func TestGetStruct_RoundTripsPersistedValue(t *testing.T) {
 	}
 }
 
+func TestPersistString_SupportsLiteralBracketSegments(t *testing.T) {
+	store := newTestStore(t, "app1")
+	key := `chats["00VG8oldVESkQAy2kvqD2nQ"].providerChatID`
+
+	if err := store.PersistString(key, "13145044"); err != nil {
+		t.Fatalf("persist string: %v", err)
+	}
+
+	if got := store.GetString(key, ""); got != "13145044" {
+		t.Fatalf("GetString = %q, want %q", got, "13145044")
+	}
+
+	chats, ok := store.data["chats"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected chats map")
+	}
+	entry, ok := chats["00VG8oldVESkQAy2kvqD2nQ"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected raw UUID key to exist unchanged")
+	}
+	if got, _ := entry["provider_chat_id"].(string); got != "13145044" {
+		t.Fatalf("provider_chat_id = %q, want %q", got, "13145044")
+	}
+}
+
+func TestPersistString_SupportsMultipleLiteralBracketSegments(t *testing.T) {
+	store := newTestStore(t, "app1")
+	key := `provider_chats["telegram"]["13145044"]`
+
+	if err := store.PersistString(key, "00VG8oldTKXoMwnJfYCZ4ec"); err != nil {
+		t.Fatalf("persist string: %v", err)
+	}
+
+	if got := store.GetString(key, ""); got != "00VG8oldTKXoMwnJfYCZ4ec" {
+		t.Fatalf("GetString = %q, want %q", got, "00VG8oldTKXoMwnJfYCZ4ec")
+	}
+
+	root, ok := store.data["provider_chats"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected provider_chats map")
+	}
+	telegram, ok := root["telegram"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected telegram map")
+	}
+	if got, _ := telegram["13145044"].(string); got != "00VG8oldTKXoMwnJfYCZ4ec" {
+		t.Fatalf("stored value = %q, want %q", got, "00VG8oldTKXoMwnJfYCZ4ec")
+	}
+}
+
+func TestGetString_MalformedPathFallsBack(t *testing.T) {
+	store := newTestStore(t, "app1")
+	if got := store.GetString(`chats[abc].x`, "fallback"); got != "fallback" {
+		t.Fatalf("GetString malformed path = %q, want %q", got, "fallback")
+	}
+}
+
+func TestPersistString_MalformedPathReturnsError(t *testing.T) {
+	store := newTestStore(t, "app1")
+
+	for _, key := range []string{
+		`chats[abc].x`,
+		`.name`,
+		`name.`,
+		`chats[]`,
+		`chats["abc].x`,
+	} {
+		if err := store.PersistString(key, "v"); err == nil {
+			t.Fatalf("expected malformed key %q to return error", key)
+		}
+	}
+}
+
+func TestPersistString_LiteralBracketEscapesRoundTrip(t *testing.T) {
+	store := newTestStore(t, "app1")
+
+	keyDouble := `chats["a\"b"].enabled`
+	if err := store.PersistBool(keyDouble, true); err != nil {
+		t.Fatalf("persist bool with double-quoted escape: %v", err)
+	}
+	if got := store.GetBool(keyDouble, false); !got {
+		t.Fatalf("GetBool double-quoted escape = %v, want true", got)
+	}
+
+	keySingle := `chats['a\'b'].enabled`
+	if err := store.PersistBool(keySingle, true); err != nil {
+		t.Fatalf("persist bool with single-quoted escape: %v", err)
+	}
+	if got := store.GetBool(keySingle, false); !got {
+		t.Fatalf("GetBool single-quoted escape = %v, want true", got)
+	}
+}
+
 func TestGetProjectDir_ReturnsModuleDirForMatchingApp(t *testing.T) {
 	moduleDir := writeTempModule(t, "github.com/example/app1")
 	nestedDir := filepath.Join(moduleDir, "cmd", "app1")
