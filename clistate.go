@@ -38,6 +38,20 @@ type pathSegment struct {
 	value string
 }
 
+func (s *Store) Path() string {
+	if s == nil {
+		return ""
+	}
+	return s.path
+}
+
+func (s *Store) ParentPath() string {
+	if s == nil || s.parent == nil {
+		return ""
+	}
+	return s.parent.path
+}
+
 // NewGlobal creates a global store at ~/.<app>/<name>.json
 // e.g. NewGlobal("vix", "state") -> ~/.vix/state.json
 func NewGlobal(app, name string) (*Store, error) {
