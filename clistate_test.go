@@ -3,7 +3,9 @@ package clistate
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestGetString_PrefersStoredValue(t *testing.T) {
@@ -37,6 +39,18 @@ func TestGetInt_PrefersStoredValue(t *testing.T) {
 
 	if got := store.GetInt("count", 1); got != 7 {
 		t.Fatalf("GetInt = %d, want %d", got, 7)
+	}
+}
+
+func TestPersistInt_KeepsInMemoryValueAsInt(t *testing.T) {
+	store := newTestStore(t, "app1")
+	if err := store.PersistInt("count", 7); err != nil {
+		t.Fatalf("persist int: %v", err)
+	}
+
+	got := store.Get("count", nil)
+	if gotInt, ok := got.(int); !ok || gotInt != 7 {
+		t.Fatalf("Get count = %#v (%T), want int(7)", got, got)
 	}
 }
 
@@ -165,6 +179,203 @@ func TestPersistString_LiteralBracketEscapesRoundTrip(t *testing.T) {
 	}
 }
 
+func TestPersist_PreservesLoadedLayoutWhenUpdatingExistingKey(t *testing.T) {
+	store := newTestStore(t, "app1")
+	writeStoreFile(t, store, `{
+  "z": 1,
+  "a": {
+    "b": 2,
+    "a": 1
+  },
+  "m": 3
+}`)
+
+	if err := store.PersistInt("a.b", 22); err != nil {
+		t.Fatalf("persist nested int: %v", err)
+	}
+
+	want := `{
+  "z": 1,
+  "a": {
+    "b": 22,
+    "a": 1
+  },
+  "m": 3
+}`
+	if got := readStoreFile(t, store); got != want {
+		t.Fatalf("config JSON:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+func TestPersist_AppendsNewRootKeyAfterLoadedKeys(t *testing.T) {
+	store := newTestStore(t, "app1")
+	writeStoreFile(t, store, `{
+  "b": 1,
+  "a": 2
+}`)
+
+	if err := store.PersistInt("c", 3); err != nil {
+		t.Fatalf("persist new key: %v", err)
+	}
+
+	want := `{
+  "b": 1,
+  "a": 2,
+  "c": 3
+}`
+	if got := readStoreFile(t, store); got != want {
+		t.Fatalf("config JSON:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+func TestPersist_AppendsNewNestedKeyAfterLoadedKeys(t *testing.T) {
+	store := newTestStore(t, "app1")
+	writeStoreFile(t, store, `{
+  "outer": {
+    "z": 1,
+    "a": 2
+  },
+  "tail": true
+}`)
+
+	if err := store.PersistInt("outer.m", 3); err != nil {
+		t.Fatalf("persist nested key: %v", err)
+	}
+
+	want := `{
+  "outer": {
+    "z": 1,
+    "a": 2,
+    "m": 3
+  },
+  "tail": true
+}`
+	if got := readStoreFile(t, store); got != want {
+		t.Fatalf("config JSON:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+func TestSave_UsesDeterministicFallbackLayoutForUnknownKeys(t *testing.T) {
+	store := newTestStore(t, "app1")
+	store.loaded = true
+	store.data = map[string]any{
+		"c": float64(3),
+		"b": float64(2),
+		"a": float64(1),
+	}
+	store.layout = &objectLayout{keys: []string{"b"}}
+
+	if err := store.save(); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	want := `{
+  "b": 2,
+  "a": 1,
+  "c": 3
+}`
+	if got := readStoreFile(t, store); got != want {
+		t.Fatalf("config JSON:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+func TestPersist_UnchangedValueDoesNotRewriteFile(t *testing.T) {
+	store := newTestStore(t, "app1")
+	writeStoreFile(t, store, `{
+  "name": "Alice"
+}`)
+	fixedTime := time.Unix(123, 0)
+	if err := os.Chtimes(store.path, fixedTime, fixedTime); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+
+	if err := store.PersistString("name", "Alice"); err != nil {
+		t.Fatalf("persist same string: %v", err)
+	}
+
+	info, err := os.Stat(store.path)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if !info.ModTime().Equal(fixedTime) {
+		t.Fatalf("file was rewritten: mtime = %v, want %v", info.ModTime(), fixedTime)
+	}
+}
+
+func TestPersist_PreservesNestedObjectLayoutInsideArrays(t *testing.T) {
+	store := newTestStore(t, "app1")
+	writeStoreFile(t, store, `{
+  "items": [
+    {
+      "z": 1,
+      "a": 2
+    }
+  ]
+}`)
+
+	if err := store.PersistInt("new_key", 3); err != nil {
+		t.Fatalf("persist root key: %v", err)
+	}
+
+	want := `{
+  "items": [
+    {
+      "z": 1,
+      "a": 2
+    }
+  ],
+  "new_key": 3
+}`
+	if got := readStoreFile(t, store); got != want {
+		t.Fatalf("config JSON:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+func TestPersistStruct_TypedMapPreservesExistingLayoutAndAppendsNewKeys(t *testing.T) {
+	type command struct {
+		Name string `json:"name"`
+	}
+
+	store := newTestStore(t, "app1")
+	writeStoreFile(t, store, `{
+  "commands": {
+    "z": {
+      "name": "z"
+    },
+    "a": {
+      "name": "a"
+    }
+  }
+}`)
+
+	var commands map[string]command
+	if ok := store.GetStruct("commands", &commands); !ok {
+		t.Fatalf("GetStruct commands returned false")
+	}
+	commands["m"] = command{Name: "m"}
+
+	if err := store.PersistStruct("commands", commands); err != nil {
+		t.Fatalf("persist typed commands map: %v", err)
+	}
+
+	want := `{
+  "commands": {
+    "z": {
+      "name": "z"
+    },
+    "a": {
+      "name": "a"
+    },
+    "m": {
+      "name": "m"
+    }
+  }
+}`
+	if got := readStoreFile(t, store); got != want {
+		t.Fatalf("config JSON:\n%s\nwant:\n%s", got, want)
+	}
+}
+
 func TestGetProjectDir_ReturnsModuleDirForMatchingApp(t *testing.T) {
 	moduleDir := writeTempModule(t, "github.com/example/app1")
 	nestedDir := filepath.Join(moduleDir, "cmd", "app1")
@@ -222,6 +433,24 @@ func newTestStore(t *testing.T, app string) *Store {
 		path: filepath.Join(t.TempDir(), "config.json"),
 		data: make(map[string]any),
 	}
+}
+
+func writeStoreFile(t *testing.T, store *Store, content string) {
+	t.Helper()
+
+	if err := os.WriteFile(store.path, []byte(strings.TrimSpace(content)), 0o600); err != nil {
+		t.Fatalf("write store file: %v", err)
+	}
+}
+
+func readStoreFile(t *testing.T, store *Store) string {
+	t.Helper()
+
+	b, err := os.ReadFile(store.path)
+	if err != nil {
+		t.Fatalf("read store file: %v", err)
+	}
+	return string(b)
 }
 
 func writeTempModule(t *testing.T, modulePath string) string {

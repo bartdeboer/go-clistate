@@ -18,6 +18,7 @@ type Store struct {
 	app    string
 	path   string
 	data   map[string]any
+	layout *objectLayout
 	loaded bool
 
 	parent *Store
@@ -287,18 +288,26 @@ func (s *Store) load() {
 		return
 	}
 	s.loaded = true
+	if s.layout == nil {
+		s.layout = newObjectLayout()
+	}
 
 	b, err := os.ReadFile(s.path)
 	if err != nil {
 		return
 	}
-	_ = json.Unmarshal(b, &s.data)
+	data, layout, err := readJSONDocument(b)
+	if err != nil {
+		return
+	}
+	s.data = data
+	s.layout = layout
 }
 
 func (s *Store) save() error {
 	tmp := s.path + ".tmp"
 
-	b, err := json.MarshalIndent(s.data, "", "  ")
+	b, err := writeJSONDocument(s.data, s.layout)
 	if err != nil {
 		return err
 	}
@@ -330,7 +339,14 @@ func (s *Store) persist(key string, val any) error {
 	defer s.mu.Unlock()
 
 	s.load()
-	if err := setInMap(s.data, key, val); err != nil {
+	normalized, valueLayout, err := normalizePersistedValue(val)
+	if err != nil {
+		return err
+	}
+	if old, ok := getFromMap(s.data, key); ok && jsonEquivalent(old, normalized) {
+		return nil
+	}
+	if err := setInMap(s.data, s.layout, key, normalized, valueLayout); err != nil {
 		return err
 	}
 	return s.save()
@@ -489,34 +505,49 @@ func getFromMap(root map[string]any, key string) (any, bool) {
 }
 
 // setInMap mirrors getFromMap but creates intermediate maps as needed.
-func setInMap(root map[string]any, key string, val any) error {
+func setInMap(root map[string]any, layout *objectLayout, key string, val any, valueLayout *objectLayout) error {
 	segs, err := parsePath(key)
 	if err != nil {
 		return err
 	}
 	m := root
+	o := ensureObjectLayout(layout)
 
 	for i, seg := range segs {
 		stored := resolveSegmentKey(seg)
 		if i == len(segs)-1 {
+			existingChild := o.child(stored)
+			if _, ok := m[stored]; !ok {
+				o.appendKey(stored)
+			}
 			m[stored] = val
+			o.setChild(stored, mergeLayoutForValue(val, existingChild, valueLayout))
 			return nil
 		}
 		next, ok := m[stored]
 		if !ok {
 			child := map[string]any{}
 			m[stored] = child
+			o.appendKey(stored)
+			o.setChild(stored, newObjectLayout())
 			m = child
+			o = o.child(stored)
 			continue
 		}
 		asMap, ok := next.(map[string]any)
 		if !ok {
 			child := map[string]any{}
 			m[stored] = child
+			o.setChild(stored, newObjectLayout())
 			m = child
+			o = o.child(stored)
 			continue
 		}
+		if o.child(stored) == nil {
+			o.setChild(stored, layoutFromValue(asMap))
+		}
 		m = asMap
+		o = o.child(stored)
 	}
 
 	return nil
