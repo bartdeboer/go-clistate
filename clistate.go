@@ -17,7 +17,7 @@ import (
 type Store struct {
 	app    string
 	path   string
-	data   map[string]any
+	root   *node
 	loaded bool
 
 	parent *Store
@@ -66,7 +66,7 @@ func NewGlobal(app, name string) (*Store, error) {
 	return &Store{
 		app:  app,
 		path: filepath.Join(dir, name+".json"),
-		data: make(map[string]any),
+		root: newObjectNode(),
 	}, nil
 }
 
@@ -82,7 +82,7 @@ func NewCwd(app, name string) (*Store, error) {
 	s := &Store{
 		app:  app,
 		path: filepath.Join(dir, name+".json"),
-		data: make(map[string]any),
+		root: newObjectNode(),
 	}
 
 	// Try to attach matching global as parent, but don't fail if it breaks.
@@ -287,18 +287,28 @@ func (s *Store) load() {
 		return
 	}
 	s.loaded = true
+	if s.root == nil {
+		s.root = newObjectNode()
+	}
 
 	b, err := os.ReadFile(s.path)
 	if err != nil {
 		return
 	}
-	_ = json.Unmarshal(b, &s.data)
+	var root node
+	if err := json.Unmarshal(b, &root); err != nil {
+		return
+	}
+	if _, ok := root.object(); !ok {
+		return
+	}
+	s.root = &root
 }
 
 func (s *Store) save() error {
 	tmp := s.path + ".tmp"
 
-	b, err := json.MarshalIndent(s.data, "", "  ")
+	b, err := json.MarshalIndent(s.root, "", "  ")
 	if err != nil {
 		return err
 	}
@@ -313,14 +323,14 @@ func (s *Store) get(key string) (any, bool) {
 	defer s.mu.Unlock()
 
 	s.load()
-	if v, ok := getFromMap(s.data, key); ok {
+	if v, ok := getFromNode(s.root, key); ok {
 		return v, true
 	}
 	if s.parent != nil {
 		s.parent.mu.Lock()
 		defer s.parent.mu.Unlock()
 		s.parent.load()
-		return getFromMap(s.parent.data, key)
+		return getFromNode(s.parent.root, key)
 	}
 	return nil, false
 }
@@ -330,7 +340,14 @@ func (s *Store) persist(key string, val any) error {
 	defer s.mu.Unlock()
 
 	s.load()
-	if err := setInMap(s.data, key, val); err != nil {
+	valueNode, err := newNodeFromPersistedValue(val)
+	if err != nil {
+		return err
+	}
+	if old, ok := getFromNode(s.root, key); ok && jsonEquivalent(old, valueNode.value) {
+		return nil
+	}
+	if err := setInNode(s.root, key, valueNode); err != nil {
 		return err
 	}
 	return s.save()
@@ -460,63 +477,81 @@ func parsePath(path string) ([]pathSegment, error) {
 	return segs, nil
 }
 
-// getFromMap traverses nested maps using parsed path segments.
+// getFromNode traverses nested objects using parsed path segments.
 // Field segments are snake-cased. Literal bracket segments are not.
-func getFromMap(root map[string]any, key string) (any, bool) {
+func getFromNode(root *node, key string) (any, bool) {
 	segs, err := parsePath(key)
 	if err != nil {
 		return nil, false
 	}
-	m := any(root)
+	current := root
 
 	for i, seg := range segs {
 		stored := resolveSegmentKey(seg)
-
-		asMap, ok := m.(map[string]any)
+		obj, ok := current.object()
 		if !ok {
 			return nil, false
 		}
-		v, ok := asMap[stored]
+		v, ok := obj[stored]
 		if !ok {
 			return nil, false
 		}
 		if i == len(segs)-1 {
 			return v, true
 		}
-		m = v
+		current = current.child(stored)
+		if current == nil {
+			current = newNodeFromValue(v)
+		}
 	}
 	return nil, false
 }
 
-// setInMap mirrors getFromMap but creates intermediate maps as needed.
-func setInMap(root map[string]any, key string, val any) error {
+// setInNode mirrors getFromNode but creates intermediate objects as needed.
+func setInNode(root *node, key string, valueNode *node) error {
 	segs, err := parsePath(key)
 	if err != nil {
 		return err
 	}
-	m := root
+	current := root
 
 	for i, seg := range segs {
 		stored := resolveSegmentKey(seg)
+		obj := current.ensureObject()
 		if i == len(segs)-1 {
-			m[stored] = val
+			existingChild := current.child(stored)
+			if _, ok := obj[stored]; !ok {
+				current.appendKey(stored)
+			}
+			merged := mergeNodes(existingChild, valueNode)
+			current.setChild(stored, merged)
+			obj[stored] = merged.value
 			return nil
 		}
-		next, ok := m[stored]
+
+		next, ok := obj[stored]
 		if !ok {
-			child := map[string]any{}
-			m[stored] = child
-			m = child
+			child := newObjectNode()
+			obj[stored] = child.value
+			current.appendKey(stored)
+			current.setChild(stored, child)
+			current = child
 			continue
 		}
-		asMap, ok := next.(map[string]any)
-		if !ok {
-			child := map[string]any{}
-			m[stored] = child
-			m = child
+
+		child := current.child(stored)
+		if child == nil {
+			child = newNodeFromValue(next)
+			current.setChild(stored, child)
+		}
+		if _, ok := child.object(); !ok {
+			child = newObjectNode()
+			obj[stored] = child.value
+			current.setChild(stored, child)
+			current = child
 			continue
 		}
-		m = asMap
+		current = child
 	}
 
 	return nil
