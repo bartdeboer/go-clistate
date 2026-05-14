@@ -98,7 +98,7 @@ func TestPersistString_SupportsLiteralBracketSegments(t *testing.T) {
 		t.Fatalf("GetString = %q, want %q", got, "13145044")
 	}
 
-	chats, ok := store.data["chats"].(map[string]any)
+	chats, ok := rootObject(t, store)["chats"].(map[string]any)
 	if !ok {
 		t.Fatalf("expected chats map")
 	}
@@ -123,7 +123,7 @@ func TestPersistString_SupportsMultipleLiteralBracketSegments(t *testing.T) {
 		t.Fatalf("GetString = %q, want %q", got, "00VG8oldTKXoMwnJfYCZ4ec")
 	}
 
-	root, ok := store.data["provider_chats"].(map[string]any)
+	root, ok := rootObject(t, store)["provider_chats"].(map[string]any)
 	if !ok {
 		t.Fatalf("expected provider_chats map")
 	}
@@ -258,12 +258,14 @@ func TestPersist_AppendsNewNestedKeyAfterLoadedKeys(t *testing.T) {
 func TestSave_UsesDeterministicFallbackLayoutForUnknownKeys(t *testing.T) {
 	store := newTestStore(t, "app1")
 	store.loaded = true
-	store.data = map[string]any{
-		"c": float64(3),
-		"b": float64(2),
-		"a": float64(1),
+	store.root = &node{
+		value: map[string]any{
+			"c": float64(3),
+			"b": float64(2),
+			"a": float64(1),
+		},
+		keys: []string{"b"},
 	}
-	store.layout = &objectLayout{keys: []string{"b"}}
 
 	if err := store.save(); err != nil {
 		t.Fatalf("save: %v", err)
@@ -302,7 +304,7 @@ func TestPersist_UnchangedValueDoesNotRewriteFile(t *testing.T) {
 	}
 }
 
-func TestPersist_PreservesNestedObjectLayoutInsideArrays(t *testing.T) {
+func TestPersist_PreservesNestedJSONLayoutInsideArrays(t *testing.T) {
 	store := newTestStore(t, "app1")
 	writeStoreFile(t, store, `{
   "items": [
@@ -431,8 +433,18 @@ func newTestStore(t *testing.T, app string) *Store {
 	return &Store{
 		app:  app,
 		path: filepath.Join(t.TempDir(), "config.json"),
-		data: make(map[string]any),
+		root: newObjectNode(),
 	}
+}
+
+func rootObject(t *testing.T, store *Store) map[string]any {
+	t.Helper()
+
+	obj, ok := store.root.object()
+	if !ok {
+		t.Fatalf("root is not a JSON object")
+	}
+	return obj
 }
 
 func writeStoreFile(t *testing.T, store *Store, content string) {

@@ -9,327 +9,358 @@ import (
 	"sort"
 )
 
-type objectLayout struct {
+type node struct {
+	value    any
 	keys     []string
-	children map[string]*objectLayout
-	items    []*objectLayout
+	children map[string]*node
+	items    []*node
 }
 
-func newObjectLayout() *objectLayout {
-	return &objectLayout{children: make(map[string]*objectLayout)}
-}
-
-func ensureObjectLayout(layout *objectLayout) *objectLayout {
-	if layout == nil {
-		return newObjectLayout()
+func newObjectNode() *node {
+	return &node{
+		value:    map[string]any{},
+		children: make(map[string]*node),
 	}
-	if layout.children == nil {
-		layout.children = make(map[string]*objectLayout)
-	}
-	return layout
 }
 
-func (o *objectLayout) appendKey(key string) {
-	if o == nil {
+func newNodeFromPersistedValue(v any) (*node, error) {
+	switch t := v.(type) {
+	case nil, bool, string,
+		int, int8, int16, int32, int64,
+		uint, uint8, uint16, uint32, uint64,
+		float32, float64:
+		return &node{value: t}, nil
+	default:
+		b, err := json.Marshal(t)
+		if err != nil {
+			return nil, err
+		}
+		var n node
+		if err := json.Unmarshal(b, &n); err != nil {
+			return nil, err
+		}
+		return &n, nil
+	}
+}
+
+func newNodeFromValue(v any) *node {
+	switch t := v.(type) {
+	case map[string]any:
+		n := newObjectNode()
+		n.value = t
+		for _, key := range sortedKeys(t) {
+			n.appendKey(key)
+			n.setChild(key, newNodeFromValue(t[key]))
+		}
+		return n
+	case []any:
+		n := &node{value: t}
+		for _, item := range t {
+			n.items = append(n.items, newNodeFromValue(item))
+		}
+		return n
+	default:
+		return &node{value: v}
+	}
+}
+
+func (n *node) UnmarshalJSON(b []byte) error {
+	parsed, err := readNodeFromBytes(b)
+	if err != nil {
+		return err
+	}
+	*n = *parsed
+	return nil
+}
+
+func (n node) MarshalJSON() ([]byte, error) {
+	var buf bytes.Buffer
+	if err := n.writeJSON(&buf); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+func readNodeFromBytes(b []byte) (*node, error) {
+	dec := json.NewDecoder(bytes.NewReader(b))
+	n, err := readNode(dec)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		if err == nil {
+			err = fmt.Errorf("unexpected trailing JSON token")
+		}
+		return nil, err
+	}
+	return n, nil
+}
+
+func readNode(dec *json.Decoder) (*node, error) {
+	tok, err := dec.Token()
+	if err != nil {
+		return nil, err
+	}
+
+	delim, ok := tok.(json.Delim)
+	if !ok {
+		return &node{value: tok}, nil
+	}
+
+	switch delim {
+	case '{':
+		obj := make(map[string]any)
+		n := &node{value: obj, children: make(map[string]*node)}
+		for dec.More() {
+			keyTok, err := dec.Token()
+			if err != nil {
+				return nil, err
+			}
+			key, ok := keyTok.(string)
+			if !ok {
+				return nil, fmt.Errorf("object key is not a string")
+			}
+			child, err := readNode(dec)
+			if err != nil {
+				return nil, err
+			}
+			if _, seen := obj[key]; !seen {
+				n.keys = append(n.keys, key)
+			}
+			obj[key] = child.value
+			n.children[key] = child
+		}
+		if _, err := dec.Token(); err != nil {
+			return nil, err
+		}
+		return n, nil
+	case '[':
+		var arr []any
+		n := &node{value: arr}
+		for dec.More() {
+			item, err := readNode(dec)
+			if err != nil {
+				return nil, err
+			}
+			arr = append(arr, item.value)
+			n.items = append(n.items, item)
+		}
+		if _, err := dec.Token(); err != nil {
+			return nil, err
+		}
+		n.value = arr
+		return n, nil
+	default:
+		return nil, fmt.Errorf("unexpected JSON delimiter %q", delim)
+	}
+}
+
+func (n *node) object() (map[string]any, bool) {
+	if n == nil {
+		return nil, false
+	}
+	obj, ok := n.value.(map[string]any)
+	return obj, ok
+}
+
+func (n *node) ensureObject() map[string]any {
+	if obj, ok := n.object(); ok {
+		if n.children == nil {
+			n.children = make(map[string]*node)
+		}
+		return obj
+	}
+	obj := map[string]any{}
+	n.value = obj
+	n.keys = nil
+	n.children = make(map[string]*node)
+	n.items = nil
+	return obj
+}
+
+func (n *node) appendKey(key string) {
+	if n == nil {
 		return
 	}
-	for _, existing := range o.keys {
+	for _, existing := range n.keys {
 		if existing == key {
 			return
 		}
 	}
-	o.keys = append(o.keys, key)
+	n.keys = append(n.keys, key)
 }
 
-func (o *objectLayout) child(key string) *objectLayout {
-	if o == nil {
+func (n *node) child(key string) *node {
+	if n == nil {
 		return nil
 	}
-	return o.children[key]
+	return n.children[key]
 }
 
-func (o *objectLayout) setChild(key string, child *objectLayout) {
-	if o == nil {
+func (n *node) setChild(key string, child *node) {
+	if n == nil {
 		return
 	}
-	if o.children == nil {
-		o.children = make(map[string]*objectLayout)
+	if n.children == nil {
+		n.children = make(map[string]*node)
 	}
 	if child == nil {
-		delete(o.children, key)
+		delete(n.children, key)
 		return
 	}
-	o.children[key] = child
+	n.children[key] = child
 }
 
-func layoutFromValue(v any) *objectLayout {
-	return mergeLayoutForValue(v, nil, nil)
-}
+func mergeNodes(existing, incoming *node) *node {
+	if incoming == nil {
+		return nil
+	}
 
-func mergeLayoutForValue(v any, existing, incoming *objectLayout) *objectLayout {
-	switch t := v.(type) {
-	case map[string]any:
-		o := newObjectLayout()
-		seen := make(map[string]bool, len(t))
+	incomingObject, ok := incoming.value.(map[string]any)
+	if ok {
+		merged := &node{value: incomingObject, children: make(map[string]*node)}
+		seen := make(map[string]bool, len(incomingObject))
+
 		if existing != nil {
 			for _, key := range existing.keys {
-				if _, ok := t[key]; !ok || seen[key] {
+				if _, ok := incomingObject[key]; !ok || seen[key] {
 					continue
 				}
-				o.keys = append(o.keys, key)
-				o.setChild(key, mergeLayoutForValue(t[key], existing.child(key), childLayout(incoming, key)))
+				merged.keys = append(merged.keys, key)
+				merged.setChild(key, mergeNodes(existing.child(key), incoming.child(key)))
 				seen[key] = true
 			}
 		}
-		if incoming != nil {
-			for _, key := range incoming.keys {
-				if _, ok := t[key]; !ok || seen[key] {
-					continue
-				}
-				o.keys = append(o.keys, key)
-				o.setChild(key, mergeLayoutForValue(t[key], nil, incoming.child(key)))
-				seen[key] = true
+
+		for _, key := range incoming.keys {
+			if _, ok := incomingObject[key]; !ok || seen[key] {
+				continue
 			}
+			merged.keys = append(merged.keys, key)
+			merged.setChild(key, mergeNodes(nil, incoming.child(key)))
+			seen[key] = true
 		}
+
 		var fallback []string
-		for key := range t {
+		for key := range incomingObject {
 			if !seen[key] {
 				fallback = append(fallback, key)
 			}
 		}
 		sort.Strings(fallback)
 		for _, key := range fallback {
-			o.keys = append(o.keys, key)
-			o.setChild(key, mergeLayoutForValue(t[key], nil, childLayout(incoming, key)))
+			merged.keys = append(merged.keys, key)
+			merged.setChild(key, mergeNodes(nil, incoming.child(key)))
 		}
-		return o
-	case []any:
-		o := &objectLayout{}
-		for i, item := range t {
-			o.items = append(o.items, mergeLayoutForValue(item, itemLayout(existing, i), itemLayout(incoming, i)))
+		return merged
+	}
+
+	incomingArray, ok := incoming.value.([]any)
+	if ok {
+		merged := &node{value: incomingArray}
+		for i := range incomingArray {
+			merged.items = append(merged.items, mergeNodes(itemNode(existing, i), itemNode(incoming, i)))
 		}
-		return o
-	default:
+		return merged
+	}
+
+	return incoming
+}
+
+func itemNode(n *node, i int) *node {
+	if n == nil || i < 0 || i >= len(n.items) {
 		return nil
 	}
+	return n.items[i]
 }
 
-func normalizePersistedValue(v any) (any, *objectLayout, error) {
-	switch t := v.(type) {
-	case nil, bool, string,
-		int, int8, int16, int32, int64,
-		uint, uint8, uint16, uint32, uint64,
-		float32, float64:
-		return t, nil, nil
-	default:
-		b, err := json.Marshal(t)
-		if err != nil {
-			return nil, nil, err
-		}
-		normalized, layout, err := readJSONValueFromBytes(b)
-		return normalized, layout, err
-	}
-}
-
-func readJSONDocument(b []byte) (map[string]any, *objectLayout, error) {
-	v, layout, err := readJSONValueFromBytes(b)
-	if err != nil {
-		return nil, nil, err
-	}
-	root, ok := v.(map[string]any)
-	if !ok {
-		return nil, nil, fmt.Errorf("root JSON value must be an object")
-	}
-	if layout == nil {
-		layout = newObjectLayout()
-	}
-	return root, layout, nil
-}
-
-func readJSONValueFromBytes(b []byte) (any, *objectLayout, error) {
-	dec := json.NewDecoder(bytes.NewReader(b))
-	v, layout, err := readJSONValue(dec)
-	if err != nil {
-		return nil, nil, err
-	}
-	if _, err := dec.Token(); err != io.EOF {
-		if err == nil {
-			err = fmt.Errorf("unexpected trailing JSON token")
-		}
-		return nil, nil, err
-	}
-	return v, layout, nil
-}
-
-func readJSONValue(dec *json.Decoder) (any, *objectLayout, error) {
-	tok, err := dec.Token()
-	if err != nil {
-		return nil, nil, err
+func (n *node) writeJSON(buf *bytes.Buffer) error {
+	if n == nil {
+		buf.WriteString("null")
+		return nil
 	}
 
-	if delim, ok := tok.(json.Delim); ok {
-		switch delim {
-		case '{':
-			obj := make(map[string]any)
-			layout := newObjectLayout()
-			for dec.More() {
-				keyTok, err := dec.Token()
-				if err != nil {
-					return nil, nil, err
-				}
-				key, ok := keyTok.(string)
-				if !ok {
-					return nil, nil, fmt.Errorf("object key is not a string")
-				}
-				val, child, err := readJSONValue(dec)
-				if err != nil {
-					return nil, nil, err
-				}
-				obj[key] = val
-				layout.keys = append(layout.keys, key)
-				layout.setChild(key, child)
-			}
-			if _, err := dec.Token(); err != nil {
-				return nil, nil, err
-			}
-			return obj, layout, nil
-		case '[':
-			var arr []any
-			layout := &objectLayout{}
-			for dec.More() {
-				val, child, err := readJSONValue(dec)
-				if err != nil {
-					return nil, nil, err
-				}
-				arr = append(arr, val)
-				layout.items = append(layout.items, child)
-			}
-			if _, err := dec.Token(); err != nil {
-				return nil, nil, err
-			}
-			return arr, layout, nil
-		}
-	}
-
-	return tok, nil, nil
-}
-
-func writeJSONDocument(data map[string]any, layout *objectLayout) ([]byte, error) {
-	var buf bytes.Buffer
-	if err := writeJSONValue(&buf, data, layout, 0); err != nil {
-		return nil, err
-	}
-	return buf.Bytes(), nil
-}
-
-func writeJSONValue(buf *bytes.Buffer, v any, layout *objectLayout, depth int) error {
-	switch t := v.(type) {
+	switch value := n.value.(type) {
 	case map[string]any:
-		return writeJSONObject(buf, t, layout, depth)
+		return n.writeObject(buf, value)
 	case []any:
-		return writeJSONArray(buf, t, layout, depth)
+		return n.writeArray(buf, value)
 	default:
-		b, err := json.Marshal(t)
+		b, err := json.Marshal(value)
 		if err != nil {
 			return err
-		}
-		normalized, normalizedLayout, err := readJSONValueFromBytes(b)
-		if err == nil {
-			switch normalized.(type) {
-			case map[string]any, []any:
-				return writeJSONValue(buf, normalized, normalizedLayout, depth)
-			}
 		}
 		buf.Write(b)
 		return nil
 	}
 }
 
-func writeJSONObject(buf *bytes.Buffer, obj map[string]any, layout *objectLayout, depth int) error {
+func (n *node) writeObject(buf *bytes.Buffer, obj map[string]any) error {
 	buf.WriteByte('{')
-	keys := layoutKeys(obj, layout)
+	keys := n.keysFor(obj)
 	for i, key := range keys {
-		if i == 0 {
-			buf.WriteByte('\n')
-		} else {
-			buf.WriteString(",\n")
+		if i > 0 {
+			buf.WriteByte(',')
 		}
-		writeIndent(buf, depth+1)
 		keyJSON, _ := json.Marshal(key)
 		buf.Write(keyJSON)
-		buf.WriteString(": ")
-		if err := writeJSONValue(buf, obj[key], childLayout(layout, key), depth+1); err != nil {
+		buf.WriteByte(':')
+		child := n.child(key)
+		if child == nil {
+			child = newNodeFromValue(obj[key])
+		}
+		if err := child.writeJSON(buf); err != nil {
 			return err
 		}
-	}
-	if len(keys) > 0 {
-		buf.WriteByte('\n')
-		writeIndent(buf, depth)
 	}
 	buf.WriteByte('}')
 	return nil
 }
 
-func writeJSONArray(buf *bytes.Buffer, arr []any, layout *objectLayout, depth int) error {
+func (n *node) writeArray(buf *bytes.Buffer, arr []any) error {
 	buf.WriteByte('[')
 	for i, item := range arr {
-		if i == 0 {
-			buf.WriteByte('\n')
-		} else {
-			buf.WriteString(",\n")
+		if i > 0 {
+			buf.WriteByte(',')
 		}
-		writeIndent(buf, depth+1)
-		if err := writeJSONValue(buf, item, itemLayout(layout, i), depth+1); err != nil {
+		child := itemNode(n, i)
+		if child == nil {
+			child = newNodeFromValue(item)
+		}
+		if err := child.writeJSON(buf); err != nil {
 			return err
 		}
-	}
-	if len(arr) > 0 {
-		buf.WriteByte('\n')
-		writeIndent(buf, depth)
 	}
 	buf.WriteByte(']')
 	return nil
 }
 
-func layoutKeys(obj map[string]any, layout *objectLayout) []string {
+func (n *node) keysFor(obj map[string]any) []string {
 	seen := make(map[string]bool, len(obj))
 	keys := make([]string, 0, len(obj))
-	if layout != nil {
-		for _, key := range layout.keys {
-			if _, ok := obj[key]; ok && !seen[key] {
-				keys = append(keys, key)
-				seen[key] = true
-			}
+	for _, key := range n.keys {
+		if _, ok := obj[key]; ok && !seen[key] {
+			keys = append(keys, key)
+			seen[key] = true
 		}
 	}
-	var unknown []string
+	var fallback []string
 	for key := range obj {
 		if !seen[key] {
-			unknown = append(unknown, key)
+			fallback = append(fallback, key)
 		}
 	}
-	sort.Strings(unknown)
-	return append(keys, unknown...)
+	sort.Strings(fallback)
+	return append(keys, fallback...)
 }
 
-func childLayout(layout *objectLayout, key string) *objectLayout {
-	if layout == nil {
-		return nil
+func sortedKeys(obj map[string]any) []string {
+	keys := make([]string, 0, len(obj))
+	for key := range obj {
+		keys = append(keys, key)
 	}
-	return layout.children[key]
-}
-
-func itemLayout(layout *objectLayout, i int) *objectLayout {
-	if layout == nil || i < 0 || i >= len(layout.items) {
-		return nil
-	}
-	return layout.items[i]
-}
-
-func writeIndent(buf *bytes.Buffer, depth int) {
-	for i := 0; i < depth; i++ {
-		buf.WriteString("  ")
-	}
+	sort.Strings(keys)
+	return keys
 }
 
 func jsonEquivalent(a, b any) bool {
