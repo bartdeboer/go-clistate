@@ -496,6 +496,23 @@ func TestConfigLayers_ExplicitOverlayWriteVisibleWhenNotShadowed(t *testing.T) {
 	}
 }
 
+func TestConfigLayers_WritesReadableJSONWithoutHTMLEscapes(t *testing.T) {
+	store := newTestStore(t, "app1")
+	writeStoreFile(t, store, `{}`)
+
+	if err := store.PersistOverlayStruct("10-local", "commands.git.args_pattern", "<branch>"); err != nil {
+		t.Fatalf("PersistOverlayStruct: %v", err)
+	}
+
+	got := readOverlayFile(t, store, "10-local.json")
+	if strings.Contains(got, `\u003c`) || strings.Contains(got, `\u003e`) {
+		t.Fatalf("overlay JSON contains HTML escapes:\n%s", got)
+	}
+	if !strings.Contains(got, `"<branch>"`) {
+		t.Fatalf("overlay JSON missing readable args pattern:\n%s", got)
+	}
+}
+
 func TestConfigLayers_BaseWriteShadowsExistingOverlay(t *testing.T) {
 	store := newTestStore(t, "app1")
 	writeStoreFile(t, store, `{}`)
@@ -828,6 +845,16 @@ func readStoreFile(t *testing.T, store *Store) string {
 	b, err := os.ReadFile(store.path)
 	if err != nil {
 		t.Fatalf("read store file: %v", err)
+	}
+	return string(b)
+}
+
+func readOverlayFile(t *testing.T, store *Store, name string) string {
+	t.Helper()
+
+	b, err := os.ReadFile(filepath.Join(filepath.Dir(store.path), "config.d", name))
+	if err != nil {
+		t.Fatalf("read overlay file: %v", err)
 	}
 	return string(b)
 }

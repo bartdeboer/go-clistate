@@ -332,7 +332,7 @@ func (n *node) writeJSON(buf *bytes.Buffer) error {
 	case []any:
 		return n.writeArray(buf, value)
 	default:
-		b, err := json.Marshal(value)
+		b, err := marshalJSONNoHTMLEscape(value)
 		if err != nil {
 			return err
 		}
@@ -348,7 +348,7 @@ func (n *node) writeObject(buf *bytes.Buffer, obj map[string]any) error {
 		if i > 0 {
 			buf.WriteByte(',')
 		}
-		keyJSON, _ := json.Marshal(key)
+		keyJSON, _ := marshalJSONNoHTMLEscape(key)
 		buf.Write(keyJSON)
 		buf.WriteByte(':')
 		child := n.child(key)
@@ -398,6 +398,16 @@ func (n *node) keysFor(obj map[string]any) []string {
 	}
 	sort.Strings(fallback)
 	return append(keys, fallback...)
+}
+
+func marshalJSONNoHTMLEscape(value any) ([]byte, error) {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(value); err != nil {
+		return nil, err
+	}
+	return bytes.TrimSuffix(buf.Bytes(), []byte("\n")), nil
 }
 
 func sortedKeys(obj map[string]any) []string {

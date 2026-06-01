@@ -1,6 +1,7 @@
 package clistate
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -224,10 +225,14 @@ func readConfigNode(path string) (*node, error) {
 }
 
 func writeConfigNode(path string, root *node) error {
-	b, err := json.MarshalIndent(root, "", "  ")
-	if err != nil {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(root); err != nil {
 		return err
 	}
+	b := bytes.TrimSuffix(buf.Bytes(), []byte("\n"))
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
