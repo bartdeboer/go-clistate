@@ -378,6 +378,171 @@ func TestPersistStruct_TypedMapPreservesExistingLayoutAndAppendsNewKeys(t *testi
 	}
 }
 
+func TestConfigOverlays_DeepMergeObjects(t *testing.T) {
+	store := newTestStore(t, "app1")
+	writeStoreFile(t, store, `{
+  "commands": {
+    "base": {
+      "name": "base",
+      "enabled": true
+    }
+  }
+}`)
+	writeOverlayFile(t, store, "10-local.json", `{
+  "commands": {
+    "local": {
+      "name": "local"
+    }
+  }
+}`)
+
+	var got map[string]map[string]any
+	if ok := store.GetStruct("commands", &got); !ok {
+		t.Fatalf("GetStruct commands returned false")
+	}
+	if _, ok := got["base"]; !ok {
+		t.Fatalf("base command missing after overlay merge: %#v", got)
+	}
+	if _, ok := got["local"]; !ok {
+		t.Fatalf("local command missing after overlay merge: %#v", got)
+	}
+}
+
+func TestConfigOverlays_ArraysReplace(t *testing.T) {
+	store := newTestStore(t, "app1")
+	writeStoreFile(t, store, `{
+  "items": ["base", "keep"]
+}`)
+	writeOverlayFile(t, store, "10-local.json", `{
+  "items": ["overlay"]
+}`)
+
+	var got []string
+	if ok := store.GetStruct("items", &got); !ok {
+		t.Fatalf("GetStruct items returned false")
+	}
+	if len(got) != 1 || got[0] != "overlay" {
+		t.Fatalf("items = %#v, want overlay replacement", got)
+	}
+}
+
+func TestConfigOverlays_LaterOverlayWins(t *testing.T) {
+	store := newTestStore(t, "app1")
+	writeStoreFile(t, store, `{
+  "name": "base"
+}`)
+	writeOverlayFile(t, store, "10-first.json", `{
+  "name": "first"
+}`)
+	writeOverlayFile(t, store, "20-second.json", `{
+  "name": "second"
+}`)
+
+	resolved := store.ResolveString("name", "")
+	if resolved.Err != nil {
+		t.Fatalf("ResolveString error: %v", resolved.Err)
+	}
+	if resolved.Value != "second" {
+		t.Fatalf("name = %q, want second", resolved.Value)
+	}
+	if got := resolved.Source.String(); got != "overlay 20-second.json" {
+		t.Fatalf("source = %q, want overlay 20-second.json", got)
+	}
+}
+
+func TestConfigOverlays_BasePersistIsShadowedByOverlay(t *testing.T) {
+	store := newTestStore(t, "app1")
+	writeStoreFile(t, store, `{
+  "name": "base"
+}`)
+	writeOverlayFile(t, store, "10-local.json", `{
+  "name": "overlay"
+}`)
+
+	if err := store.PersistString("name", "new-base"); err != nil {
+		t.Fatalf("PersistString: %v", err)
+	}
+	if got := store.GetString("name", ""); got != "overlay" {
+		t.Fatalf("effective name = %q, want overlay", got)
+	}
+
+	reloaded := newTestStoreAtPath(t, "app1", store.path)
+	if got := reloaded.GetString("name", ""); got != "overlay" {
+		t.Fatalf("reloaded effective name = %q, want overlay", got)
+	}
+	base := readStoreFile(t, store)
+	if !strings.Contains(base, `"name": "new-base"`) {
+		t.Fatalf("base config was not updated: %s", base)
+	}
+}
+
+func TestConfigOverlays_ExplicitOverlayWriteAffectsEffectiveRead(t *testing.T) {
+	store := newTestStore(t, "app1")
+	writeStoreFile(t, store, `{
+  "name": "base"
+}`)
+
+	if err := store.PersistOverlayString("10-local", "name", "overlay"); err != nil {
+		t.Fatalf("PersistOverlayString: %v", err)
+	}
+	if got := store.GetString("name", ""); got != "overlay" {
+		t.Fatalf("effective name = %q, want overlay", got)
+	}
+	if _, err := os.Stat(filepath.Join(filepath.Dir(store.path), "config.d", "10-local.json")); err != nil {
+		t.Fatalf("overlay file not created: %v", err)
+	}
+}
+
+func TestConfigOverlays_InvalidOverlayReturnsResolveError(t *testing.T) {
+	store := newTestStore(t, "app1")
+	writeStoreFile(t, store, `{
+  "name": "base"
+}`)
+	writeOverlayFile(t, store, "10-bad.json", `{not-json}`)
+
+	resolved := store.ResolveString("name", "fallback")
+	if resolved.Err == nil {
+		t.Fatalf("expected invalid overlay error")
+	}
+	if !strings.Contains(resolved.Err.Error(), "invalid overlay JSON") {
+		t.Fatalf("error = %v, want invalid overlay JSON", resolved.Err)
+	}
+}
+
+func TestGetterOverrides_ZeroValuesAreExplicit(t *testing.T) {
+	store := newTestStore(t, "app1")
+	if err := store.PersistString("name", "stored"); err != nil {
+		t.Fatalf("PersistString: %v", err)
+	}
+	if err := store.PersistInt("count", 7); err != nil {
+		t.Fatalf("PersistInt: %v", err)
+	}
+	if err := store.PersistFloat("ratio", 1.5); err != nil {
+		t.Fatalf("PersistFloat: %v", err)
+	}
+	if err := store.PersistBool("enabled", true); err != nil {
+		t.Fatalf("PersistBool: %v", err)
+	}
+
+	empty := ""
+	zero := 0
+	zeroFloat := 0.0
+	falsy := false
+
+	if got := store.GetString("name", "default", &empty); got != "" {
+		t.Fatalf("GetString override = %q, want empty string", got)
+	}
+	if got := store.GetInt("count", 99, &zero); got != 0 {
+		t.Fatalf("GetInt override = %d, want 0", got)
+	}
+	if got := store.GetFloat("ratio", 9.9, &zeroFloat); got != 0 {
+		t.Fatalf("GetFloat override = %f, want 0", got)
+	}
+	if got := store.GetBool("enabled", true, &falsy); got {
+		t.Fatalf("GetBool override = %v, want false", got)
+	}
+}
+
 func TestGetProjectDir_ReturnsModuleDirForMatchingApp(t *testing.T) {
 	moduleDir := writeTempModule(t, "github.com/example/app1")
 	nestedDir := filepath.Join(moduleDir, "cmd", "app1")
@@ -430,9 +595,15 @@ func TestGetProjectDir_FallsBackToStoredProjectDir(t *testing.T) {
 func newTestStore(t *testing.T, app string) *Store {
 	t.Helper()
 
+	return newTestStoreAtPath(t, app, filepath.Join(t.TempDir(), "config.json"))
+}
+
+func newTestStoreAtPath(t *testing.T, app, path string) *Store {
+	t.Helper()
+
 	return &Store{
 		app:  app,
-		path: filepath.Join(t.TempDir(), "config.json"),
+		path: path,
 		root: newObjectNode(),
 	}
 }
@@ -452,6 +623,18 @@ func writeStoreFile(t *testing.T, store *Store, content string) {
 
 	if err := os.WriteFile(store.path, []byte(strings.TrimSpace(content)), 0o600); err != nil {
 		t.Fatalf("write store file: %v", err)
+	}
+}
+
+func writeOverlayFile(t *testing.T, store *Store, name, content string) {
+	t.Helper()
+
+	path := filepath.Join(filepath.Dir(store.path), "config.d", name)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("mkdir overlay dir: %v", err)
+	}
+	if err := os.WriteFile(path, []byte(strings.TrimSpace(content)), 0o600); err != nil {
+		t.Fatalf("write overlay file: %v", err)
 	}
 }
 

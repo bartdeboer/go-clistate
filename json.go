@@ -211,6 +211,20 @@ func (n *node) setChild(key string, child *node) {
 	n.children[key] = child
 }
 
+func (n *node) removeKey(key string) {
+	if n == nil {
+		return
+	}
+	next := n.keys[:0]
+	for _, existing := range n.keys {
+		if existing != key {
+			next = append(next, existing)
+		}
+	}
+	n.keys = next
+	delete(n.children, key)
+}
+
 func mergeNodes(existing, incoming *node) *node {
 	if incoming == nil {
 		return nil
@@ -272,6 +286,37 @@ func itemNode(n *node, i int) *node {
 		return nil
 	}
 	return n.items[i]
+}
+
+func unsetInNode(root *node, key string) error {
+	segs, err := parsePath(key)
+	if err != nil {
+		return err
+	}
+	current := root
+	for i, seg := range segs {
+		stored := resolveSegmentKey(seg)
+		obj, ok := current.object()
+		if !ok {
+			return nil
+		}
+		if i == len(segs)-1 {
+			delete(obj, stored)
+			current.removeKey(stored)
+			return nil
+		}
+		child := current.child(stored)
+		if child == nil {
+			next, ok := obj[stored]
+			if !ok {
+				return nil
+			}
+			child = newNodeFromValue(next)
+			current.setChild(stored, child)
+		}
+		current = child
+	}
+	return nil
 }
 
 func (n *node) writeJSON(buf *bytes.Buffer) error {

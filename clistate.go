@@ -110,85 +110,128 @@ func (s *Store) Get(key string, fallback any) any {
 }
 
 func (s *Store) GetString(key, def string, override ...*string) string {
-	if len(override) > 0 && override[0] != nil && *override[0] != "" {
-		return *override[0]
-	}
-	if v, ok := s.get(key); ok {
-		if str, ok := v.(string); ok && str != "" {
-			return str
-		}
-	}
-	return def
+	return s.ResolveString(key, def, override...).Value
 }
 
 func (s *Store) GetInt(key string, def int, override ...*int) int {
-	if len(override) > 0 && override[0] != nil && *override[0] != 0 {
-		return *override[0]
-	}
-	if v, ok := s.get(key); ok {
-		switch t := v.(type) {
-		case float64:
-			if int(t) != 0 {
-				return int(t)
-			}
-		case float32:
-			if int(t) != 0 {
-				return int(t)
-			}
-		case int:
-			if t != 0 {
-				return t
-			}
-		}
-	}
-	return def
+	return s.ResolveInt(key, def, override...).Value
 }
 
 func (s *Store) GetFloat(key string, def float64, override ...*float64) float64 {
-	if len(override) > 0 && override[0] != nil && *override[0] != 0 {
-		return *override[0]
-	}
-	if v, ok := s.get(key); ok {
-		switch t := v.(type) {
-		case float64:
-			if t != 0 {
-				return t
-			}
-		case float32:
-			if t != 0 {
-				return float64(t)
-			}
-		case int:
-			if t != 0 {
-				return float64(t)
-			}
-		}
-	}
-	return def
+	return s.ResolveFloat(key, def, override...).Value
 }
 
 func (s *Store) GetBool(key string, def bool, override ...*bool) bool {
+	return s.ResolveBool(key, def, override...).Value
+}
+
+func (s *Store) ResolveString(key, def string, override ...*string) Resolved[string] {
 	if len(override) > 0 && override[0] != nil {
-		return *override[0]
+		return Resolved[string]{Value: *override[0], Source: overrideSource()}
 	}
-	if v, ok := s.get(key); ok {
-		if b, ok := v.(bool); ok {
-			return b
+	v, source, ok, err := s.resolveValue(key)
+	if err != nil {
+		return Resolved[string]{Value: def, Source: defaultSource(), Err: err}
+	}
+	if ok {
+		if str, ok := v.(string); ok && str != "" {
+			return Resolved[string]{Value: str, Source: source}
 		}
 	}
-	return def
+	return Resolved[string]{Value: def, Source: defaultSource()}
+}
+
+func (s *Store) ResolveInt(key string, def int, override ...*int) Resolved[int] {
+	if len(override) > 0 && override[0] != nil {
+		return Resolved[int]{Value: *override[0], Source: overrideSource()}
+	}
+	v, source, ok, err := s.resolveValue(key)
+	if err != nil {
+		return Resolved[int]{Value: def, Source: defaultSource(), Err: err}
+	}
+	if ok {
+		switch t := v.(type) {
+		case float64:
+			if int(t) != 0 {
+				return Resolved[int]{Value: int(t), Source: source}
+			}
+		case float32:
+			if int(t) != 0 {
+				return Resolved[int]{Value: int(t), Source: source}
+			}
+		case int:
+			if t != 0 {
+				return Resolved[int]{Value: t, Source: source}
+			}
+		}
+	}
+	return Resolved[int]{Value: def, Source: defaultSource()}
+}
+
+func (s *Store) ResolveFloat(key string, def float64, override ...*float64) Resolved[float64] {
+	if len(override) > 0 && override[0] != nil {
+		return Resolved[float64]{Value: *override[0], Source: overrideSource()}
+	}
+	v, source, ok, err := s.resolveValue(key)
+	if err != nil {
+		return Resolved[float64]{Value: def, Source: defaultSource(), Err: err}
+	}
+	if ok {
+		switch t := v.(type) {
+		case float64:
+			if t != 0 {
+				return Resolved[float64]{Value: t, Source: source}
+			}
+		case float32:
+			if t != 0 {
+				return Resolved[float64]{Value: float64(t), Source: source}
+			}
+		case int:
+			if t != 0 {
+				return Resolved[float64]{Value: float64(t), Source: source}
+			}
+		}
+	}
+	return Resolved[float64]{Value: def, Source: defaultSource()}
+}
+
+func (s *Store) ResolveBool(key string, def bool, override ...*bool) Resolved[bool] {
+	if len(override) > 0 && override[0] != nil {
+		return Resolved[bool]{Value: *override[0], Source: overrideSource()}
+	}
+	v, source, ok, err := s.resolveValue(key)
+	if err != nil {
+		return Resolved[bool]{Value: def, Source: defaultSource(), Err: err}
+	}
+	if ok {
+		if b, ok := v.(bool); ok {
+			return Resolved[bool]{Value: b, Source: source}
+		}
+	}
+	return Resolved[bool]{Value: def, Source: defaultSource()}
 }
 
 func (s *Store) GetStruct(key string, out any) bool {
-	v, ok := s.get(key)
+	_, ok, err := s.ResolveStruct(key, out)
+	return ok && err == nil
+}
+
+func (s *Store) ResolveStruct(key string, out any) (Source, bool, error) {
+	v, source, ok, err := s.resolveValue(key)
+	if err != nil {
+		return defaultSource(), false, err
+	}
 	if !ok {
-		return false
+		return defaultSource(), false, nil
 	}
 	b, err := json.Marshal(v)
 	if err != nil {
-		return false
+		return source, false, err
 	}
-	return json.Unmarshal(b, out) == nil
+	if err := json.Unmarshal(b, out); err != nil {
+		return source, false, err
+	}
+	return source, true, nil
 }
 
 func (s *Store) GetProjectDir() string {
@@ -280,6 +323,36 @@ func (s *Store) PersistStruct(key string, val any) error {
 	return s.persist(key, val)
 }
 
+func (s *Store) PersistOverlayString(layerName, key, val string) error {
+	return s.persistOverlay(layerName, key, val)
+}
+func (s *Store) PersistOverlayInt(layerName, key string, val int) error {
+	return s.persistOverlay(layerName, key, val)
+}
+func (s *Store) PersistOverlayFloat(layerName, key string, val float64) error {
+	return s.persistOverlay(layerName, key, val)
+}
+func (s *Store) PersistOverlayBool(layerName, key string, val bool) error {
+	return s.persistOverlay(layerName, key, val)
+}
+func (s *Store) PersistOverlayStruct(layerName, key string, val any) error {
+	return s.persistOverlay(layerName, key, val)
+}
+
+func (s *Store) UnsetOverlay(layerName, key string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	path, root, err := s.loadOverlayForWrite(layerName)
+	if err != nil {
+		return err
+	}
+	if err := unsetInNode(root, key); err != nil {
+		return err
+	}
+	return writeConfigNode(path, root)
+}
+
 // -------------- internals --------------
 
 func (s *Store) load() {
@@ -306,33 +379,35 @@ func (s *Store) load() {
 }
 
 func (s *Store) save() error {
-	tmp := s.path + ".tmp"
-
-	b, err := json.MarshalIndent(s.root, "", "  ")
-	if err != nil {
-		return err
-	}
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, s.path)
+	return writeConfigNode(s.path, s.root)
 }
 
 func (s *Store) get(key string) (any, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	s.load()
-	if v, ok := getFromNode(s.root, key); ok {
+	v, _, ok, err := s.resolveValue(key)
+	if err == nil && ok {
 		return v, true
 	}
-	if s.parent != nil {
-		s.parent.mu.Lock()
-		defer s.parent.mu.Unlock()
-		s.parent.load()
-		return getFromNode(s.parent.root, key)
-	}
 	return nil, false
+}
+
+func (s *Store) resolveValue(key string) (any, Source, bool, error) {
+	s.mu.Lock()
+	root, layers, err := s.effectiveRootAndLayers()
+	if err != nil {
+		s.mu.Unlock()
+		return nil, defaultSource(), false, err
+	}
+	if v, ok := getFromNode(root, key); ok {
+		source := s.sourceForKey(key, layers)
+		s.mu.Unlock()
+		return v, source, true, nil
+	}
+	s.mu.Unlock()
+
+	if s.parent != nil {
+		return s.parent.resolveValue(key)
+	}
+	return nil, defaultSource(), false, nil
 }
 
 func (s *Store) persist(key string, val any) error {
@@ -351,6 +426,44 @@ func (s *Store) persist(key string, val any) error {
 		return err
 	}
 	return s.save()
+}
+
+func (s *Store) persistOverlay(layerName, key string, val any) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	valueNode, err := newNodeFromPersistedValue(val)
+	if err != nil {
+		return err
+	}
+	path, root, err := s.loadOverlayForWrite(layerName)
+	if err != nil {
+		return err
+	}
+	if old, ok := getFromNode(root, key); ok && jsonEquivalent(old, valueNode.value) {
+		return nil
+	}
+	if err := setInNode(root, key, valueNode); err != nil {
+		return err
+	}
+	return writeConfigNode(path, root)
+}
+
+func (s *Store) loadOverlayForWrite(layerName string) (string, *node, error) {
+	path, err := s.overlayPath(layerName)
+	if err != nil {
+		return "", nil, err
+	}
+	root := newObjectNode()
+	if _, err := os.Stat(path); err == nil {
+		root, err = readConfigNode(path)
+		if err != nil {
+			return "", nil, fmt.Errorf("read overlay %q: %w", path, err)
+		}
+	} else if !os.IsNotExist(err) {
+		return "", nil, err
+	}
+	return path, root, nil
 }
 
 func normalizeFieldName(v string) string {
