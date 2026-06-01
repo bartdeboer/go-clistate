@@ -543,6 +543,36 @@ func TestGetterOverrides_ZeroValuesAreExplicit(t *testing.T) {
 	}
 }
 
+func TestGetters_StoredZeroValuesBeatDefaults(t *testing.T) {
+	store := newTestStore(t, "app1")
+	writeStoreFile(t, store, `{
+  "name": "",
+  "count": 0,
+  "ratio": 0
+}`)
+
+	if got := store.GetString("name", "default"); got != "" {
+		t.Fatalf("GetString = %q, want empty string", got)
+	}
+	if got := store.ResolveString("name", "default"); got.Err != nil || got.Value != "" {
+		t.Fatalf("ResolveString = (%q, %v), want empty string and nil error", got.Value, got.Err)
+	}
+
+	if got := store.GetInt("count", 99); got != 0 {
+		t.Fatalf("GetInt = %d, want 0", got)
+	}
+	if got := store.ResolveInt("count", 99); got.Err != nil || got.Value != 0 {
+		t.Fatalf("ResolveInt = (%d, %v), want 0 and nil error", got.Value, got.Err)
+	}
+
+	if got := store.GetFloat("ratio", 9.9); got != 0 {
+		t.Fatalf("GetFloat = %f, want 0", got)
+	}
+	if got := store.ResolveFloat("ratio", 9.9); got.Err != nil || got.Value != 0 {
+		t.Fatalf("ResolveFloat = (%f, %v), want 0 and nil error", got.Value, got.Err)
+	}
+}
+
 func TestGetProjectDir_ReturnsModuleDirForMatchingApp(t *testing.T) {
 	moduleDir := writeTempModule(t, "github.com/example/app1")
 	nestedDir := filepath.Join(moduleDir, "cmd", "app1")

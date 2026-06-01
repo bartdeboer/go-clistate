@@ -134,7 +134,7 @@ func (s *Store) ResolveString(key, def string, override ...*string) Resolved[str
 		return Resolved[string]{Value: def, Source: defaultSource(), Err: err}
 	}
 	if ok {
-		if str, ok := v.(string); ok && str != "" {
+		if str, ok := v.(string); ok {
 			return Resolved[string]{Value: str, Source: source}
 		}
 	}
@@ -152,17 +152,11 @@ func (s *Store) ResolveInt(key string, def int, override ...*int) Resolved[int] 
 	if ok {
 		switch t := v.(type) {
 		case float64:
-			if int(t) != 0 {
-				return Resolved[int]{Value: int(t), Source: source}
-			}
+			return Resolved[int]{Value: int(t), Source: source}
 		case float32:
-			if int(t) != 0 {
-				return Resolved[int]{Value: int(t), Source: source}
-			}
+			return Resolved[int]{Value: int(t), Source: source}
 		case int:
-			if t != 0 {
-				return Resolved[int]{Value: t, Source: source}
-			}
+			return Resolved[int]{Value: t, Source: source}
 		}
 	}
 	return Resolved[int]{Value: def, Source: defaultSource()}
@@ -179,17 +173,11 @@ func (s *Store) ResolveFloat(key string, def float64, override ...*float64) Reso
 	if ok {
 		switch t := v.(type) {
 		case float64:
-			if t != 0 {
-				return Resolved[float64]{Value: t, Source: source}
-			}
+			return Resolved[float64]{Value: t, Source: source}
 		case float32:
-			if t != 0 {
-				return Resolved[float64]{Value: float64(t), Source: source}
-			}
+			return Resolved[float64]{Value: float64(t), Source: source}
 		case int:
-			if t != 0 {
-				return Resolved[float64]{Value: float64(t), Source: source}
-			}
+			return Resolved[float64]{Value: float64(t), Source: source}
 		}
 	}
 	return Resolved[float64]{Value: def, Source: defaultSource()}
