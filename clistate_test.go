@@ -496,6 +496,47 @@ func TestConfigLayers_ExplicitOverlayWriteVisibleWhenNotShadowed(t *testing.T) {
 	}
 }
 
+func TestConfigLayers_BaseWriteShadowsExistingOverlay(t *testing.T) {
+	store := newTestStore(t, "app1")
+	writeStoreFile(t, store, `{}`)
+	writeOverlayFile(t, store, "10-local.json", `{
+  "name": "overlay"
+}`)
+
+	if err := store.PersistString("name", "base"); err != nil {
+		t.Fatalf("PersistString: %v", err)
+	}
+
+	resolved := store.ResolveString("name", "")
+	if resolved.Err != nil {
+		t.Fatalf("ResolveString error: %v", resolved.Err)
+	}
+	if resolved.Value != "base" {
+		t.Fatalf("name = %q, want base", resolved.Value)
+	}
+	if got := resolved.Source.String(); got != "config.json" {
+		t.Fatalf("source = %q, want config.json", got)
+	}
+}
+
+func TestConfigLayers_UnsetOverlayRebuildsEffectiveRoot(t *testing.T) {
+	store := newTestStore(t, "app1")
+	writeStoreFile(t, store, `{}`)
+	writeOverlayFile(t, store, "10-local.json", `{
+  "foo": "bar"
+}`)
+
+	if got := store.GetString("foo", "missing"); got != "bar" {
+		t.Fatalf("foo before unset = %q, want bar", got)
+	}
+	if err := store.UnsetOverlay("10-local", "foo"); err != nil {
+		t.Fatalf("UnsetOverlay: %v", err)
+	}
+	if got := store.GetString("foo", "missing"); got != "missing" {
+		t.Fatalf("foo after unset = %q, want missing", got)
+	}
+}
+
 func TestConfigLayers_LaterConfigDFileWinsWithinOverlayLevel(t *testing.T) {
 	store := newTestStore(t, "app1")
 	writeStoreFile(t, store, `{}`)
@@ -515,6 +556,51 @@ func TestConfigLayers_LaterConfigDFileWinsWithinOverlayLevel(t *testing.T) {
 	}
 	if got := resolved.Source.String(); got != "20-second.json" {
 		t.Fatalf("source = %q, want 20-second.json", got)
+	}
+}
+
+func TestConfigLayers_ParentFallbackParticipatesInEffectiveMerge(t *testing.T) {
+	dir := t.TempDir()
+	parent := newTestStoreAtPath(t, "app1", filepath.Join(dir, "parent", "config.json"))
+	child := newTestStoreAtPath(t, "app1", filepath.Join(dir, "child", "config.json"))
+	child.parent = parent
+
+	writeStoreFile(t, parent, `{
+  "settings": {
+    "parent_only": "parent",
+    "parent_overlay": "parent",
+    "shared": "parent"
+  }
+}`)
+	writeStoreFile(t, child, `{
+  "settings": {
+    "child_only": "child",
+    "shared": "child"
+  }
+}`)
+	writeOverlayFile(t, child, "10-local.json", `{
+  "settings": {
+    "overlay_only": "overlay",
+    "parent_overlay": "overlay",
+    "shared": "overlay"
+  }
+}`)
+
+	var got map[string]string
+	if ok := child.GetStruct("settings", &got); !ok {
+		t.Fatalf("GetStruct settings returned false")
+	}
+	want := map[string]string{
+		"parent_only":    "parent",
+		"overlay_only":   "overlay",
+		"parent_overlay": "overlay",
+		"child_only":     "child",
+		"shared":         "child",
+	}
+	for key, wantValue := range want {
+		if got[key] != wantValue {
+			t.Fatalf("settings[%q] = %q, want %q (all settings: %#v)", key, got[key], wantValue, got)
+		}
 	}
 }
 
@@ -716,6 +802,9 @@ func rootObject(t *testing.T, store *Store) map[string]any {
 func writeStoreFile(t *testing.T, store *Store, content string) {
 	t.Helper()
 
+	if err := os.MkdirAll(filepath.Dir(store.path), 0o755); err != nil {
+		t.Fatalf("mkdir store dir: %v", err)
+	}
 	if err := os.WriteFile(store.path, []byte(strings.TrimSpace(content)), 0o600); err != nil {
 		t.Fatalf("write store file: %v", err)
 	}
