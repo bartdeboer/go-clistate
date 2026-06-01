@@ -404,7 +404,7 @@ func TestConfigLayers_ConfigJSONWinsOverConfigDForScalar(t *testing.T) {
 	}
 }
 
-func TestConfigLayers_GetStructReturnsWinningObjectWithoutMerge(t *testing.T) {
+func TestConfigLayers_GetStructReturnsEffectiveMergedObject(t *testing.T) {
 	store := newTestStore(t, "app1")
 	writeStoreFile(t, store, `{
   "commands": {
@@ -422,14 +422,21 @@ func TestConfigLayers_GetStructReturnsWinningObjectWithoutMerge(t *testing.T) {
 }`)
 
 	var got map[string]map[string]any
+	source, ok, err := store.ResolveStruct("commands", &got)
+	if err != nil || !ok {
+		t.Fatalf("ResolveStruct commands = (%v, %v)", ok, err)
+	}
+	if source.String() != "composite" {
+		t.Fatalf("commands source = %q, want composite", source.String())
+	}
 	if ok := store.GetStruct("commands", &got); !ok {
 		t.Fatalf("GetStruct commands returned false")
 	}
 	if _, ok := got["base"]; !ok {
-		t.Fatalf("base command missing from winning config.json object: %#v", got)
+		t.Fatalf("base command missing from effective object: %#v", got)
 	}
-	if _, ok := got["local"]; ok {
-		t.Fatalf("GetStruct deep-merged overlay command unexpectedly: %#v", got)
+	if _, ok := got["local"]; !ok {
+		t.Fatalf("local command missing from effective object: %#v", got)
 	}
 }
 
@@ -475,6 +482,9 @@ func TestConfigLayers_ExplicitOverlayWriteVisibleWhenNotShadowed(t *testing.T) {
   "name": "base"
 }`)
 
+	if got := store.GetString("overlay_name", "missing"); got != "missing" {
+		t.Fatalf("overlay_name before write = %q, want missing", got)
+	}
 	if err := store.PersistOverlayString("10-local", "overlay_name", "overlay"); err != nil {
 		t.Fatalf("PersistOverlayString: %v", err)
 	}
@@ -534,6 +544,15 @@ func TestConfigLayers_ArraysReplaceInMergedStruct(t *testing.T) {
 	}
 	if !got.OverlayOnly {
 		t.Fatalf("overlay_only missing after merge")
+	}
+
+	var items []string
+	source, ok, err := store.ResolveStruct("profile.items", &items)
+	if err != nil || !ok {
+		t.Fatalf("ResolveStruct profile.items = (%v, %v)", ok, err)
+	}
+	if source.String() != "config.json" {
+		t.Fatalf("profile.items source = %q, want config.json", source.String())
 	}
 }
 

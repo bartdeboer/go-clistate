@@ -18,6 +18,7 @@ type Store struct {
 	app    string
 	path   string
 	layers []Layer
+	root   *node
 	loaded bool
 
 	parent *Store
@@ -226,43 +227,7 @@ func (s *Store) GetMergedStruct(key string, out any) bool {
 }
 
 func (s *Store) ResolveMergedStruct(key string, out any) (Source, bool, error) {
-	n, source, ok, err := s.resolveMergedNode(key)
-	if err != nil {
-		return defaultSource(), false, err
-	}
-	if !ok {
-		return defaultSource(), false, nil
-	}
-	b, err := json.Marshal(n.value)
-	if err != nil {
-		return source, false, err
-	}
-	if err := json.Unmarshal(b, out); err != nil {
-		return source, false, err
-	}
-	return source, true, nil
-}
-
-func (s *Store) resolveMergedNode(key string) (*node, Source, bool, error) {
-	var merged *node
-	source := defaultSource()
-	found := false
-
-	if s.parent != nil {
-		parentNode, parentSource, ok, err := s.parent.resolveMergedNode(key)
-		if err != nil {
-			return nil, defaultSource(), false, err
-		}
-		if ok {
-			merged = parentNode
-			source = parentSource
-			found = true
-		}
-	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.localMergedNode(key, merged, source, found)
+	return s.ResolveStruct(key, out)
 }
 
 func (s *Store) GetProjectDir() string {
@@ -384,8 +349,7 @@ func (s *Store) UnsetOverlay(layerName, key string) error {
 	if err := writeConfigNode(path, root); err != nil {
 		return err
 	}
-	s.loaded = false
-	s.layers = nil
+	s.afterOverlayWrite(path, root)
 	return nil
 }
 
@@ -439,13 +403,23 @@ func (s *Store) persist(key string, val any) error {
 		return err
 	}
 	layer := s.baseLayer()
+	setSource(valueNode, layerSource(*layer))
 	if old, ok := getFromNode(layer.root, key); ok && jsonEquivalent(old, valueNode.value) {
 		return nil
 	}
 	if err := setInNode(layer.root, key, valueNode); err != nil {
 		return err
 	}
-	return s.save()
+	if err := s.save(); err != nil {
+		return err
+	}
+	root, err := s.effectiveRootFromLoadedLayers()
+	if err != nil {
+		return err
+	}
+	s.root = root
+	s.loaded = true
+	return nil
 }
 
 func (s *Store) persistOverlay(layerName, key string, val any) error {
@@ -460,6 +434,8 @@ func (s *Store) persistOverlay(layerName, key string, val any) error {
 	if err != nil {
 		return err
 	}
+	valueLayer := Layer{Name: filepath.Base(path), Level: overlayLayerLevel, root: root, path: path}
+	setSource(valueNode, layerSource(valueLayer))
 	if old, ok := getFromNode(root, key); ok && jsonEquivalent(old, valueNode.value) {
 		return nil
 	}
@@ -469,8 +445,7 @@ func (s *Store) persistOverlay(layerName, key string, val any) error {
 	if err := writeConfigNode(path, root); err != nil {
 		return err
 	}
-	s.loaded = false
-	s.layers = nil
+	s.afterOverlayWrite(path, root)
 	return nil
 }
 
@@ -505,6 +480,31 @@ func (s *Store) baseLayer() *Layer {
 		}
 	}
 	return &s.layers[len(s.layers)-1]
+}
+
+func (s *Store) afterOverlayWrite(path string, root *node) {
+	if !s.loaded {
+		s.layers = nil
+		s.root = nil
+		return
+	}
+	layer := Layer{Name: filepath.Base(path), Level: overlayLayerLevel, root: root, path: path}
+	setSource(root, layerSource(layer))
+	replaced := false
+	for i := range s.layers {
+		if s.layers[i].path == path {
+			s.layers[i] = layer
+			replaced = true
+			break
+		}
+	}
+	if !replaced {
+		s.layers = append(s.layers, layer)
+	}
+	sortLayersLowToHigh(s.layers)
+	if effective, err := s.effectiveRootFromLoadedLayers(); err == nil {
+		s.root = effective
+	}
 }
 
 func normalizeFieldName(v string) string {

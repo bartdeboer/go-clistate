@@ -14,6 +14,7 @@ type node struct {
 	keys     []string
 	children map[string]*node
 	items    []*node
+	source   Source
 }
 
 func newObjectNode() *node {
@@ -232,7 +233,7 @@ func mergeNodes(existing, incoming *node) *node {
 
 	incomingObject, ok := incoming.value.(map[string]any)
 	if ok {
-		merged := &node{value: incomingObject, children: make(map[string]*node)}
+		merged := &node{value: incomingObject, children: make(map[string]*node), source: incoming.source}
 		seen := make(map[string]bool, len(incomingObject))
 
 		if existing != nil {
@@ -271,7 +272,7 @@ func mergeNodes(existing, incoming *node) *node {
 
 	incomingArray, ok := incoming.value.([]any)
 	if ok {
-		merged := &node{value: incomingArray}
+		merged := &node{value: incomingArray, source: incoming.source}
 		for i := range incomingArray {
 			merged.items = append(merged.items, mergeNodes(itemNode(existing, i), itemNode(incoming, i)))
 		}

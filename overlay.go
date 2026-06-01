@@ -20,6 +20,7 @@ const (
 	sourceDefault sourceKind = iota
 	sourceOverride
 	sourceLayer
+	sourceComposite
 )
 
 // Source identifies where a resolved value came from. Its internals are opaque
@@ -55,6 +56,8 @@ func (s Source) String() string {
 			return s.name
 		}
 		return "config layer"
+	case sourceComposite:
+		return "composite"
 	default:
 		return "default"
 	}
@@ -65,6 +68,8 @@ func overrideSource() Source { return Source{kind: sourceOverride, level: 1000} 
 func layerSource(layer Layer) Source {
 	return Source{kind: sourceLayer, name: layer.Name, level: layer.Level, path: layer.path}
 }
+
+func compositeSource() Source { return Source{kind: sourceComposite} }
 
 func (s *Store) overlayDir() string {
 	base := filepath.Base(s.path)
@@ -111,8 +116,32 @@ func (s *Store) loadLayers() error {
 		return err
 	}
 	s.layers = layers
+	root, err := s.effectiveRootFromLoadedLayers()
+	if err != nil {
+		return err
+	}
+	s.root = root
 	s.loaded = true
 	return nil
+}
+
+func (s *Store) effectiveRootFromLoadedLayers() (*node, error) {
+	root := newObjectNode()
+	if s.parent != nil {
+		s.parent.mu.Lock()
+		err := s.parent.loadLayers()
+		if err == nil {
+			root = cloneNode(s.parent.root)
+		}
+		s.parent.mu.Unlock()
+		if err != nil {
+			return nil, err
+		}
+	}
+	for _, layer := range s.layers {
+		root = mergeConfigNodes(root, layer.root)
+	}
+	return root, nil
 }
 
 func (s *Store) readLocalLayers() ([]Layer, error) {
@@ -131,7 +160,9 @@ func (s *Store) readBaseLayer() Layer {
 	if parsed, err := readConfigNode(s.path); err == nil {
 		root = parsed
 	}
-	return Layer{Name: filepath.Base(s.path), Level: baseLayerLevel, root: root, path: s.path}
+	layer := Layer{Name: filepath.Base(s.path), Level: baseLayerLevel, root: root, path: s.path}
+	setSource(root, layerSource(layer))
+	return layer
 }
 
 func (s *Store) readOverlayLayers() ([]Layer, error) {
@@ -160,7 +191,9 @@ func (s *Store) readOverlayLayers() ([]Layer, error) {
 		if err != nil {
 			return nil, fmt.Errorf("invalid overlay JSON %q: %w", path, err)
 		}
-		layers = append(layers, Layer{Name: name, Level: overlayLayerLevel, root: root, path: path})
+		layer := Layer{Name: name, Level: overlayLayerLevel, root: root, path: path}
+		setSource(root, layerSource(layer))
+		layers = append(layers, layer)
 	}
 	return layers, nil
 }
@@ -209,31 +242,10 @@ func (s *Store) winningNode(key string) (*node, Source, bool, error) {
 	if err := s.loadLayers(); err != nil {
 		return nil, defaultSource(), false, err
 	}
-	for i := len(s.layers) - 1; i >= 0; i-- {
-		layer := s.layers[i]
-		if n, ok := findNode(layer.root, key); ok {
-			return n, layerSource(layer), true, nil
-		}
+	if n, ok := findNode(s.root, key); ok {
+		return n, n.source, true, nil
 	}
 	return nil, defaultSource(), false, nil
-}
-
-func (s *Store) localMergedNode(key string, merged *node, source Source, found bool) (*node, Source, bool, error) {
-	if err := s.loadLayers(); err != nil {
-		return nil, defaultSource(), false, err
-	}
-	for _, layer := range s.layers {
-		if n, ok := findNode(layer.root, key); ok {
-			if found {
-				merged = mergeConfigNodes(merged, n)
-			} else {
-				merged = cloneNode(n)
-			}
-			source = layerSource(layer)
-			found = true
-		}
-	}
-	return merged, source, found, nil
 }
 
 func mergeConfigNodes(low, high *node) *node {
@@ -247,6 +259,7 @@ func mergeConfigNodes(low, high *node) *node {
 	}
 
 	merged := cloneNode(low)
+	merged.source = mergeObjectSource(low.source, high.source)
 	mergedObj := merged.ensureObject()
 	seen := make(map[string]bool, len(highObj))
 
@@ -296,6 +309,29 @@ func applyHighKey(merged *node, mergedObj map[string]any, key string, lowObj map
 	mergedObj[key] = child.value
 }
 
+func mergeObjectSource(low, high Source) Source {
+	if low.kind == sourceDefault {
+		return high
+	}
+	if high.kind == sourceDefault || low == high {
+		return low
+	}
+	return compositeSource()
+}
+
+func setSource(n *node, source Source) {
+	if n == nil {
+		return
+	}
+	n.source = source
+	for _, child := range n.children {
+		setSource(child, source)
+	}
+	for _, item := range n.items {
+		setSource(item, source)
+	}
+}
+
 func valueAsObject(n *node) (map[string]any, bool) {
 	if n == nil {
 		return nil, false
@@ -308,6 +344,7 @@ func cloneNode(n *node) *node {
 		return nil
 	}
 	clone := &node{}
+	clone.source = n.source
 	switch value := n.value.(type) {
 	case map[string]any:
 		obj := make(map[string]any, len(value))
