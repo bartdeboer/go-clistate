@@ -221,15 +221,6 @@ func (s *Store) ResolveStruct(key string, out any) (Source, bool, error) {
 	return source, true, nil
 }
 
-func (s *Store) GetMergedStruct(key string, out any) bool {
-	_, ok, err := s.ResolveMergedStruct(key, out)
-	return ok && err == nil
-}
-
-func (s *Store) ResolveMergedStruct(key string, out any) (Source, bool, error) {
-	return s.ResolveStruct(key, out)
-}
-
 func (s *Store) GetProjectDir() string {
 	if s == nil {
 		return ""

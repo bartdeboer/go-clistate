@@ -440,7 +440,7 @@ func TestConfigLayers_GetStructReturnsEffectiveMergedObject(t *testing.T) {
 	}
 }
 
-func TestConfigLayers_GetMergedStructDeepMergesWithConfigJSONWinning(t *testing.T) {
+func TestConfigLayers_GetStructDeepMergesWithConfigJSONWinning(t *testing.T) {
 	store := newTestStore(t, "app1")
 	writeStoreFile(t, store, `{
   "commands": {
@@ -462,8 +462,8 @@ func TestConfigLayers_GetMergedStructDeepMergesWithConfigJSONWinning(t *testing.
 }`)
 
 	var got map[string]map[string]any
-	if ok := store.GetMergedStruct("commands", &got); !ok {
-		t.Fatalf("GetMergedStruct commands returned false")
+	if ok := store.GetStruct("commands", &got); !ok {
+		t.Fatalf("GetStruct commands returned false")
 	}
 	if _, ok := got["local"]; !ok {
 		t.Fatalf("local command missing after explicit merge: %#v", got)
@@ -518,7 +518,7 @@ func TestConfigLayers_LaterConfigDFileWinsWithinOverlayLevel(t *testing.T) {
 	}
 }
 
-func TestConfigLayers_ArraysReplaceInMergedStruct(t *testing.T) {
+func TestConfigLayers_ArraysReplaceInGetStruct(t *testing.T) {
 	store := newTestStore(t, "app1")
 	writeStoreFile(t, store, `{
   "profile": {
@@ -536,8 +536,8 @@ func TestConfigLayers_ArraysReplaceInMergedStruct(t *testing.T) {
 		Items       []string `json:"items"`
 		OverlayOnly bool     `json:"overlay_only"`
 	}
-	if ok := store.GetMergedStruct("profile", &got); !ok {
-		t.Fatalf("GetMergedStruct profile returned false")
+	if ok := store.GetStruct("profile", &got); !ok {
+		t.Fatalf("GetStruct profile returned false")
 	}
 	if len(got.Items) != 1 || got.Items[0] != "base" {
 		t.Fatalf("items = %#v, want config.json array replacement", got.Items)
