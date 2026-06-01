@@ -258,14 +258,19 @@ func TestPersist_AppendsNewNestedKeyAfterLoadedKeys(t *testing.T) {
 func TestSave_UsesDeterministicFallbackLayoutForUnknownKeys(t *testing.T) {
 	store := newTestStore(t, "app1")
 	store.loaded = true
-	store.root = &node{
-		value: map[string]any{
-			"c": float64(3),
-			"b": float64(2),
-			"a": float64(1),
+	store.layers = []Layer{{
+		Name:  "config.json",
+		Level: baseLayerLevel,
+		root: &node{
+			value: map[string]any{
+				"c": float64(3),
+				"b": float64(2),
+				"a": float64(1),
+			},
+			keys: []string{"b"},
 		},
-		keys: []string{"b"},
-	}
+		path: store.path,
+	}}
 
 	if err := store.save(); err != nil {
 		t.Fatalf("save: %v", err)
@@ -378,13 +383,33 @@ func TestPersistStruct_TypedMapPreservesExistingLayoutAndAppendsNewKeys(t *testi
 	}
 }
 
-func TestConfigOverlays_DeepMergeObjects(t *testing.T) {
+func TestConfigLayers_ConfigJSONWinsOverConfigDForScalar(t *testing.T) {
+	store := newTestStore(t, "app1")
+	writeStoreFile(t, store, `{
+  "name": "base"
+}`)
+	writeOverlayFile(t, store, "10-local.json", `{
+  "name": "overlay"
+}`)
+
+	resolved := store.ResolveString("name", "")
+	if resolved.Err != nil {
+		t.Fatalf("ResolveString error: %v", resolved.Err)
+	}
+	if resolved.Value != "base" {
+		t.Fatalf("name = %q, want base", resolved.Value)
+	}
+	if got := resolved.Source.String(); got != "config.json" {
+		t.Fatalf("source = %q, want config.json", got)
+	}
+}
+
+func TestConfigLayers_GetStructReturnsWinningObjectWithoutMerge(t *testing.T) {
 	store := newTestStore(t, "app1")
 	writeStoreFile(t, store, `{
   "commands": {
     "base": {
-      "name": "base",
-      "enabled": true
+      "name": "base"
     }
   }
 }`)
@@ -401,36 +426,69 @@ func TestConfigOverlays_DeepMergeObjects(t *testing.T) {
 		t.Fatalf("GetStruct commands returned false")
 	}
 	if _, ok := got["base"]; !ok {
-		t.Fatalf("base command missing after overlay merge: %#v", got)
+		t.Fatalf("base command missing from winning config.json object: %#v", got)
 	}
-	if _, ok := got["local"]; !ok {
-		t.Fatalf("local command missing after overlay merge: %#v", got)
+	if _, ok := got["local"]; ok {
+		t.Fatalf("GetStruct deep-merged overlay command unexpectedly: %#v", got)
 	}
 }
 
-func TestConfigOverlays_ArraysReplace(t *testing.T) {
+func TestConfigLayers_GetMergedStructDeepMergesWithConfigJSONWinning(t *testing.T) {
 	store := newTestStore(t, "app1")
 	writeStoreFile(t, store, `{
-  "items": ["base", "keep"]
+  "commands": {
+    "base": {
+      "name": "base"
+    }
+  }
 }`)
 	writeOverlayFile(t, store, "10-local.json", `{
-  "items": ["overlay"]
+  "commands": {
+    "local": {
+      "name": "local"
+    },
+    "base": {
+      "name": "overlay-base",
+      "overlay_only": true
+    }
+  }
 }`)
 
-	var got []string
-	if ok := store.GetStruct("items", &got); !ok {
-		t.Fatalf("GetStruct items returned false")
+	var got map[string]map[string]any
+	if ok := store.GetMergedStruct("commands", &got); !ok {
+		t.Fatalf("GetMergedStruct commands returned false")
 	}
-	if len(got) != 1 || got[0] != "overlay" {
-		t.Fatalf("items = %#v, want overlay replacement", got)
+	if _, ok := got["local"]; !ok {
+		t.Fatalf("local command missing after explicit merge: %#v", got)
+	}
+	if got["base"]["name"] != "base" {
+		t.Fatalf("base.name = %#v, want config.json to win", got["base"]["name"])
+	}
+	if got["base"]["overlay_only"] != true {
+		t.Fatalf("base overlay_only missing after deep merge: %#v", got["base"])
 	}
 }
 
-func TestConfigOverlays_LaterOverlayWins(t *testing.T) {
+func TestConfigLayers_ExplicitOverlayWriteVisibleWhenNotShadowed(t *testing.T) {
 	store := newTestStore(t, "app1")
 	writeStoreFile(t, store, `{
   "name": "base"
 }`)
+
+	if err := store.PersistOverlayString("10-local", "overlay_name", "overlay"); err != nil {
+		t.Fatalf("PersistOverlayString: %v", err)
+	}
+	if got := store.GetString("overlay_name", ""); got != "overlay" {
+		t.Fatalf("effective overlay_name = %q, want overlay", got)
+	}
+	if _, err := os.Stat(filepath.Join(filepath.Dir(store.path), "config.d", "10-local.json")); err != nil {
+		t.Fatalf("overlay file not created: %v", err)
+	}
+}
+
+func TestConfigLayers_LaterConfigDFileWinsWithinOverlayLevel(t *testing.T) {
+	store := newTestStore(t, "app1")
+	writeStoreFile(t, store, `{}`)
 	writeOverlayFile(t, store, "10-first.json", `{
   "name": "first"
 }`)
@@ -445,51 +503,37 @@ func TestConfigOverlays_LaterOverlayWins(t *testing.T) {
 	if resolved.Value != "second" {
 		t.Fatalf("name = %q, want second", resolved.Value)
 	}
-	if got := resolved.Source.String(); got != "overlay 20-second.json" {
-		t.Fatalf("source = %q, want overlay 20-second.json", got)
+	if got := resolved.Source.String(); got != "20-second.json" {
+		t.Fatalf("source = %q, want 20-second.json", got)
 	}
 }
 
-func TestConfigOverlays_BasePersistIsShadowedByOverlay(t *testing.T) {
+func TestConfigLayers_ArraysReplaceInMergedStruct(t *testing.T) {
 	store := newTestStore(t, "app1")
 	writeStoreFile(t, store, `{
-  "name": "base"
+  "profile": {
+    "items": ["base"]
+  }
 }`)
 	writeOverlayFile(t, store, "10-local.json", `{
-  "name": "overlay"
+  "profile": {
+    "items": ["overlay", "extra"],
+    "overlay_only": true
+  }
 }`)
 
-	if err := store.PersistString("name", "new-base"); err != nil {
-		t.Fatalf("PersistString: %v", err)
+	var got struct {
+		Items       []string `json:"items"`
+		OverlayOnly bool     `json:"overlay_only"`
 	}
-	if got := store.GetString("name", ""); got != "overlay" {
-		t.Fatalf("effective name = %q, want overlay", got)
+	if ok := store.GetMergedStruct("profile", &got); !ok {
+		t.Fatalf("GetMergedStruct profile returned false")
 	}
-
-	reloaded := newTestStoreAtPath(t, "app1", store.path)
-	if got := reloaded.GetString("name", ""); got != "overlay" {
-		t.Fatalf("reloaded effective name = %q, want overlay", got)
+	if len(got.Items) != 1 || got.Items[0] != "base" {
+		t.Fatalf("items = %#v, want config.json array replacement", got.Items)
 	}
-	base := readStoreFile(t, store)
-	if !strings.Contains(base, `"name": "new-base"`) {
-		t.Fatalf("base config was not updated: %s", base)
-	}
-}
-
-func TestConfigOverlays_ExplicitOverlayWriteAffectsEffectiveRead(t *testing.T) {
-	store := newTestStore(t, "app1")
-	writeStoreFile(t, store, `{
-  "name": "base"
-}`)
-
-	if err := store.PersistOverlayString("10-local", "name", "overlay"); err != nil {
-		t.Fatalf("PersistOverlayString: %v", err)
-	}
-	if got := store.GetString("name", ""); got != "overlay" {
-		t.Fatalf("effective name = %q, want overlay", got)
-	}
-	if _, err := os.Stat(filepath.Join(filepath.Dir(store.path), "config.d", "10-local.json")); err != nil {
-		t.Fatalf("overlay file not created: %v", err)
+	if !got.OverlayOnly {
+		t.Fatalf("overlay_only missing after merge")
 	}
 }
 
@@ -634,14 +678,16 @@ func newTestStoreAtPath(t *testing.T, app, path string) *Store {
 	return &Store{
 		app:  app,
 		path: path,
-		root: newObjectNode(),
 	}
 }
 
 func rootObject(t *testing.T, store *Store) map[string]any {
 	t.Helper()
 
-	obj, ok := store.root.object()
+	if err := store.loadLayers(); err != nil {
+		t.Fatalf("load layers: %v", err)
+	}
+	obj, ok := store.baseLayer().root.object()
 	if !ok {
 		t.Fatalf("root is not a JSON object")
 	}

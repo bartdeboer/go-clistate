@@ -9,20 +9,25 @@ import (
 	"strings"
 )
 
+const (
+	overlayLayerLevel = 50
+	baseLayerLevel    = 100
+)
+
 type sourceKind int
 
 const (
 	sourceDefault sourceKind = iota
 	sourceOverride
-	sourceBase
-	sourceOverlay
+	sourceLayer
 )
 
 // Source identifies where a resolved value came from. Its internals are opaque
-// so callers do not need to know how clistate stores base and config.d files.
+// so callers do not need to know how clistate stores config files.
 type Source struct {
 	kind  sourceKind
-	layer string
+	name  string
+	level int
 	path  string
 }
 
@@ -32,37 +37,33 @@ type Resolved[T any] struct {
 	Err    error
 }
 
+// Layer is one JSON config source. Higher levels have higher priority.
+type Layer struct {
+	Name  string
+	Level int
+	root  *node
+
+	path string
+}
+
 func (s Source) String() string {
 	switch s.kind {
 	case sourceOverride:
 		return "override"
-	case sourceBase:
-		return "base config"
-	case sourceOverlay:
-		if s.layer != "" {
-			return "overlay " + s.layer
+	case sourceLayer:
+		if s.name != "" {
+			return s.name
 		}
-		return "overlay"
+		return "config layer"
 	default:
 		return "default"
 	}
 }
 
 func defaultSource() Source  { return Source{kind: sourceDefault} }
-func overrideSource() Source { return Source{kind: sourceOverride} }
-
-func (s *Store) baseSource() Source {
-	return Source{kind: sourceBase, path: s.path}
-}
-
-func overlaySource(layer overlayLayer) Source {
-	return Source{kind: sourceOverlay, layer: layer.name, path: layer.path}
-}
-
-type overlayLayer struct {
-	name string
-	path string
-	root *node
+func overrideSource() Source { return Source{kind: sourceOverride, level: 1000} }
+func layerSource(layer Layer) Source {
+	return Source{kind: sourceLayer, name: layer.Name, level: layer.Level, path: layer.path}
 }
 
 func (s *Store) overlayDir() string {
@@ -100,7 +101,40 @@ func (s *Store) overlayPath(layerName string) (string, error) {
 	return filepath.Join(s.overlayDir(), name), nil
 }
 
-func (s *Store) readOverlayLayers() ([]overlayLayer, error) {
+func (s *Store) loadLayers() error {
+	if s.loaded {
+		return nil
+	}
+
+	layers, err := s.readLocalLayers()
+	if err != nil {
+		return err
+	}
+	s.layers = layers
+	s.loaded = true
+	return nil
+}
+
+func (s *Store) readLocalLayers() ([]Layer, error) {
+	var layers []Layer
+	overlays, err := s.readOverlayLayers()
+	if err != nil {
+		return nil, err
+	}
+	layers = append(layers, overlays...)
+	layers = append(layers, s.readBaseLayer())
+	return sortLayersLowToHigh(layers), nil
+}
+
+func (s *Store) readBaseLayer() Layer {
+	root := newObjectNode()
+	if parsed, err := readConfigNode(s.path); err == nil {
+		root = parsed
+	}
+	return Layer{Name: filepath.Base(s.path), Level: baseLayerLevel, root: root, path: s.path}
+}
+
+func (s *Store) readOverlayLayers() ([]Layer, error) {
 	dir := s.overlayDir()
 	entries, err := os.ReadDir(dir)
 	if os.IsNotExist(err) {
@@ -119,16 +153,26 @@ func (s *Store) readOverlayLayers() ([]overlayLayer, error) {
 	}
 	sort.Strings(names)
 
-	layers := make([]overlayLayer, 0, len(names))
+	layers := make([]Layer, 0, len(names))
 	for _, name := range names {
 		path := filepath.Join(dir, name)
 		root, err := readConfigNode(path)
 		if err != nil {
 			return nil, fmt.Errorf("invalid overlay JSON %q: %w", path, err)
 		}
-		layers = append(layers, overlayLayer{name: name, path: path, root: root})
+		layers = append(layers, Layer{Name: name, Level: overlayLayerLevel, root: root, path: path})
 	}
 	return layers, nil
+}
+
+func sortLayersLowToHigh(layers []Layer) []Layer {
+	sort.SliceStable(layers, func(i, j int) bool {
+		if layers[i].Level != layers[j].Level {
+			return layers[i].Level < layers[j].Level
+		}
+		return layers[i].Name < layers[j].Name
+	})
+	return layers
 }
 
 func readConfigNode(path string) (*node, error) {
@@ -161,90 +205,88 @@ func writeConfigNode(path string, root *node) error {
 	return os.Rename(tmp, path)
 }
 
-func (s *Store) effectiveRootAndLayers() (*node, []overlayLayer, error) {
-	s.load()
-	root := cloneNode(s.root)
-	if root == nil {
-		root = newObjectNode()
+func (s *Store) winningNode(key string) (*node, Source, bool, error) {
+	if err := s.loadLayers(); err != nil {
+		return nil, defaultSource(), false, err
 	}
-	layers, err := s.readOverlayLayers()
-	if err != nil {
-		return nil, nil, err
-	}
-	for _, layer := range layers {
-		root = mergeConfigNodes(root, layer.root)
-	}
-	return root, layers, nil
-}
-
-func (s *Store) sourceForKey(key string, layers []overlayLayer) Source {
-	source := defaultSource()
-	if _, ok := getFromNode(s.root, key); ok {
-		source = s.baseSource()
-	}
-	for _, layer := range layers {
-		if _, ok := getFromNode(layer.root, key); ok {
-			source = overlaySource(layer)
+	for i := len(s.layers) - 1; i >= 0; i-- {
+		layer := s.layers[i]
+		if n, ok := findNode(layer.root, key); ok {
+			return n, layerSource(layer), true, nil
 		}
 	}
-	return source
+	return nil, defaultSource(), false, nil
 }
 
-func mergeConfigNodes(base, overlay *node) *node {
-	if overlay == nil {
-		return cloneNode(base)
+func (s *Store) localMergedNode(key string, merged *node, source Source, found bool) (*node, Source, bool, error) {
+	if err := s.loadLayers(); err != nil {
+		return nil, defaultSource(), false, err
 	}
-	baseObj, baseIsObject := valueAsObject(base)
-	overlayObj, overlayIsObject := valueAsObject(overlay)
-	if !baseIsObject || !overlayIsObject {
-		return cloneNode(overlay)
+	for _, layer := range s.layers {
+		if n, ok := findNode(layer.root, key); ok {
+			if found {
+				merged = mergeConfigNodes(merged, n)
+			} else {
+				merged = cloneNode(n)
+			}
+			source = layerSource(layer)
+			found = true
+		}
+	}
+	return merged, source, found, nil
+}
+
+func mergeConfigNodes(low, high *node) *node {
+	if high == nil {
+		return cloneNode(low)
+	}
+	lowObj, lowIsObject := valueAsObject(low)
+	highObj, highIsObject := valueAsObject(high)
+	if !lowIsObject || !highIsObject {
+		return cloneNode(high)
 	}
 
-	merged := cloneNode(base)
+	merged := cloneNode(low)
 	mergedObj := merged.ensureObject()
-	seen := make(map[string]bool, len(overlayObj))
+	seen := make(map[string]bool, len(highObj))
 
-	for _, key := range overlay.keys {
-		if _, ok := overlayObj[key]; !ok || seen[key] {
+	for _, key := range high.keys {
+		if _, ok := highObj[key]; !ok || seen[key] {
 			continue
 		}
-		applyOverlayKey(merged, mergedObj, key, baseObj, overlay)
+		applyHighKey(merged, mergedObj, key, lowObj, high)
 		seen[key] = true
 	}
 
 	var fallback []string
-	for key := range overlayObj {
+	for key := range highObj {
 		if !seen[key] {
 			fallback = append(fallback, key)
 		}
 	}
 	sort.Strings(fallback)
 	for _, key := range fallback {
-		applyOverlayKey(merged, mergedObj, key, baseObj, overlay)
+		applyHighKey(merged, mergedObj, key, lowObj, high)
 	}
 
 	return merged
 }
 
-func applyOverlayKey(merged *node, mergedObj map[string]any, key string, baseObj map[string]any, overlay *node) {
-	overlayChild := overlay.child(key)
-	if overlayChild == nil {
-		overlayChild = newNodeFromValue(overlay.value.(map[string]any)[key])
+func applyHighKey(merged *node, mergedObj map[string]any, key string, lowObj map[string]any, high *node) {
+	highChild := high.child(key)
+	if highChild == nil {
+		highChild = newNodeFromValue(high.value.(map[string]any)[key])
 	}
-	baseChild := merged.child(key)
-	if baseChild == nil {
-		baseChild = newNodeFromValue(baseObj[key])
+	lowChild := merged.child(key)
+	if lowChild == nil {
+		lowChild = newNodeFromValue(lowObj[key])
 	}
 
-	var child *node
-	if _, baseObject := valueAsObject(baseChild); baseObject {
-		if _, overlayObject := valueAsObject(overlayChild); overlayObject {
-			child = mergeConfigNodes(baseChild, overlayChild)
-		} else {
-			child = cloneNode(overlayChild)
+	child := cloneNode(highChild)
+	if _, lowObject := valueAsObject(lowChild); lowObject {
+		if _, highObject := valueAsObject(highChild); highObject {
+			child = mergeConfigNodes(lowChild, highChild)
 		}
-	} else {
-		child = cloneNode(overlayChild)
 	}
 
 	if _, exists := mergedObj[key]; !exists {

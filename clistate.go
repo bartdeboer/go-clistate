@@ -17,7 +17,7 @@ import (
 type Store struct {
 	app    string
 	path   string
-	root   *node
+	layers []Layer
 	loaded bool
 
 	parent *Store
@@ -66,7 +66,6 @@ func NewGlobal(app, name string) (*Store, error) {
 	return &Store{
 		app:  app,
 		path: filepath.Join(dir, name+".json"),
-		root: newObjectNode(),
 	}, nil
 }
 
@@ -82,7 +81,6 @@ func NewCwd(app, name string) (*Store, error) {
 	s := &Store{
 		app:  app,
 		path: filepath.Join(dir, name+".json"),
-		root: newObjectNode(),
 	}
 
 	// Try to attach matching global as parent, but don't fail if it breaks.
@@ -222,6 +220,51 @@ func (s *Store) ResolveStruct(key string, out any) (Source, bool, error) {
 	return source, true, nil
 }
 
+func (s *Store) GetMergedStruct(key string, out any) bool {
+	_, ok, err := s.ResolveMergedStruct(key, out)
+	return ok && err == nil
+}
+
+func (s *Store) ResolveMergedStruct(key string, out any) (Source, bool, error) {
+	n, source, ok, err := s.resolveMergedNode(key)
+	if err != nil {
+		return defaultSource(), false, err
+	}
+	if !ok {
+		return defaultSource(), false, nil
+	}
+	b, err := json.Marshal(n.value)
+	if err != nil {
+		return source, false, err
+	}
+	if err := json.Unmarshal(b, out); err != nil {
+		return source, false, err
+	}
+	return source, true, nil
+}
+
+func (s *Store) resolveMergedNode(key string) (*node, Source, bool, error) {
+	var merged *node
+	source := defaultSource()
+	found := false
+
+	if s.parent != nil {
+		parentNode, parentSource, ok, err := s.parent.resolveMergedNode(key)
+		if err != nil {
+			return nil, defaultSource(), false, err
+		}
+		if ok {
+			merged = parentNode
+			source = parentSource
+			found = true
+		}
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.localMergedNode(key, merged, source, found)
+}
+
 func (s *Store) GetProjectDir() string {
 	if s == nil {
 		return ""
@@ -338,36 +381,23 @@ func (s *Store) UnsetOverlay(layerName, key string) error {
 	if err := unsetInNode(root, key); err != nil {
 		return err
 	}
-	return writeConfigNode(path, root)
+	if err := writeConfigNode(path, root); err != nil {
+		return err
+	}
+	s.loaded = false
+	s.layers = nil
+	return nil
 }
 
 // -------------- internals --------------
 
 func (s *Store) load() {
-	if s.loaded {
-		return
-	}
-	s.loaded = true
-	if s.root == nil {
-		s.root = newObjectNode()
-	}
-
-	b, err := os.ReadFile(s.path)
-	if err != nil {
-		return
-	}
-	var root node
-	if err := json.Unmarshal(b, &root); err != nil {
-		return
-	}
-	if _, ok := root.object(); !ok {
-		return
-	}
-	s.root = &root
+	_ = s.loadLayers()
 }
 
 func (s *Store) save() error {
-	return writeConfigNode(s.path, s.root)
+	layer := s.baseLayer()
+	return writeConfigNode(layer.path, layer.root)
 }
 
 func (s *Store) get(key string) (any, bool) {
@@ -380,15 +410,14 @@ func (s *Store) get(key string) (any, bool) {
 
 func (s *Store) resolveValue(key string) (any, Source, bool, error) {
 	s.mu.Lock()
-	root, layers, err := s.effectiveRootAndLayers()
+	n, source, ok, err := s.winningNode(key)
 	if err != nil {
 		s.mu.Unlock()
 		return nil, defaultSource(), false, err
 	}
-	if v, ok := getFromNode(root, key); ok {
-		source := s.sourceForKey(key, layers)
+	if ok {
 		s.mu.Unlock()
-		return v, source, true, nil
+		return n.value, source, true, nil
 	}
 	s.mu.Unlock()
 
@@ -402,15 +431,18 @@ func (s *Store) persist(key string, val any) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.load()
+	if err := s.loadLayers(); err != nil {
+		return err
+	}
 	valueNode, err := newNodeFromPersistedValue(val)
 	if err != nil {
 		return err
 	}
-	if old, ok := getFromNode(s.root, key); ok && jsonEquivalent(old, valueNode.value) {
+	layer := s.baseLayer()
+	if old, ok := getFromNode(layer.root, key); ok && jsonEquivalent(old, valueNode.value) {
 		return nil
 	}
-	if err := setInNode(s.root, key, valueNode); err != nil {
+	if err := setInNode(layer.root, key, valueNode); err != nil {
 		return err
 	}
 	return s.save()
@@ -434,7 +466,12 @@ func (s *Store) persistOverlay(layerName, key string, val any) error {
 	if err := setInNode(root, key, valueNode); err != nil {
 		return err
 	}
-	return writeConfigNode(path, root)
+	if err := writeConfigNode(path, root); err != nil {
+		return err
+	}
+	s.loaded = false
+	s.layers = nil
+	return nil
 }
 
 func (s *Store) loadOverlayForWrite(layerName string) (string, *node, error) {
@@ -452,6 +489,22 @@ func (s *Store) loadOverlayForWrite(layerName string) (string, *node, error) {
 		return "", nil, err
 	}
 	return path, root, nil
+}
+
+func (s *Store) baseLayer() *Layer {
+	for i := range s.layers {
+		if s.layers[i].Level == baseLayerLevel && s.layers[i].path == s.path {
+			return &s.layers[i]
+		}
+	}
+	s.layers = append(s.layers, Layer{Name: filepath.Base(s.path), Level: baseLayerLevel, root: newObjectNode(), path: s.path})
+	sortLayersLowToHigh(s.layers)
+	for i := range s.layers {
+		if s.layers[i].Level == baseLayerLevel && s.layers[i].path == s.path {
+			return &s.layers[i]
+		}
+	}
+	return &s.layers[len(s.layers)-1]
 }
 
 func normalizeFieldName(v string) string {
@@ -581,6 +634,14 @@ func parsePath(path string) ([]pathSegment, error) {
 // getFromNode traverses nested objects using parsed path segments.
 // Field segments are snake-cased. Literal bracket segments are not.
 func getFromNode(root *node, key string) (any, bool) {
+	n, ok := findNode(root, key)
+	if !ok {
+		return nil, false
+	}
+	return n.value, true
+}
+
+func findNode(root *node, key string) (*node, bool) {
 	segs, err := parsePath(key)
 	if err != nil {
 		return nil, false
@@ -598,7 +659,11 @@ func getFromNode(root *node, key string) (any, bool) {
 			return nil, false
 		}
 		if i == len(segs)-1 {
-			return v, true
+			child := current.child(stored)
+			if child == nil {
+				child = newNodeFromValue(v)
+			}
+			return child, true
 		}
 		current = current.child(stored)
 		if current == nil {
